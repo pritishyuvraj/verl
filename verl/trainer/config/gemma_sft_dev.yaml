@@ -1,24 +1,119 @@
-# Run with GEMMA_PROJECT_ROOT and GEMMA_RUN_ROOT set; see the experiment record.
-# Existing 225-task dev cohort is now explicitly used for checkpoint selection.
+# Active experiment: all training, generation and validation hyperparameters below.
+# Existing 225-task dev cohort (221 runnable) is explicitly used for selection.
+# Scores are development/selection scores, not an unbiased held-out estimate.
+# Launch from the fork checkout with GEMMA_PROJECT_ROOT and a NEW GEMMA_RUN_ROOT:
+# export VERL_TRAIN_PYTHON="$GEMMA_PROJECT_ROOT/.runtime/venvs/sft-verl/bin/python"
+# export PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 VERL_USE_EXTERNAL_PLUGINS=none
+# export LD_LIBRARY_PATH="$GEMMA_PROJECT_ROOT/.runtime/cuda-compat-12-9/usr/local/cuda-12.9/compat"
+# export NCCL_TOPO_FILE="$GEMMA_PROJECT_ROOT/.runtime/nccl/autodetect.xml"
+# "$VERL_TRAIN_PYTHON" -m verl.trainer.generation_sft --config-name gemma_sft_dev workflow.execute=true
+# The existing run is already active; do not launch another copy.
 defaults:
   - gemma_sft
   - _self_
 
+# Frozen QAT-unquantized training base; fresh LoRA, never the rejected step157.
 model:
   path: ${oc.env:GEMMA_PROJECT_ROOT}/models/gemma-4-E4B-it-qat-q4_0-unquantized
   tokenizer_path: ${oc.env:GEMMA_PROJECT_ROOT}/.runtime/kaggle-tokenizer-e4b-v2
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: '.*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+  enable_gradient_checkpointing: true
+  use_remove_padding: false
+  use_fused_kernels: false
+  use_liger: false
+  override_config:
+    attn_implementation: sdpa
 
+# Existing audited v9 corpus: 5,000 train windows; full947 NLL diagnostics.
+# Batch32 = eight GPUs x microbatch1 x accumulation4. Packing is disabled.
 data:
   train_files: ${oc.env:GEMMA_PROJECT_ROOT}/outputs/sft/e4b-sft-verl-v3-thinking-v9-hor1-20261026/train.parquet
   val_files: ${oc.env:GEMMA_PROJECT_ROOT}/outputs/sft/e4b-sft-verl-v3-thinking-v9-hor1-20261026/fullval.parquet
+  train_batch_size: 32
+  micro_batch_size_per_gpu: 1
+  max_length: 32768
+  max_token_len_per_gpu: 32768
+  pad_mode: no_padding
+  truncation: error
+  use_dynamic_bsz: false
+  num_workers: 0
 
+# BF16 decoder computation, FP32 master/reductions and selected vocabulary head.
+engine:
+  strategy: fsdp2
+  model_dtype: fp32
+  use_torch_compile: false
+  ulysses_sequence_parallel_size: 1
+  use_no_sync_for_gradient_accumulation: false
+  seed: ${trainer.seed}
+  mixed_precision:
+    param_dtype: bf16
+    reduce_dtype: fp32
+    buffer_dtype: fp32
+
+# PyTorch AdamW; epsilon1e-8 is its unchanged default.
+optim:
+  optimizer: AdamW
+  optimizer_impl: torch.optim
+  lr: 5.0e-5
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+  lr_warmup_steps_ratio: 0.03
+  lr_scheduler_type: cosine
+  min_lr_ratio: 0.1
+  clip_grad: 1.0
+
+# Training exits before vLLM starts; all eight GPUs change roles together.
+generation_inference:
+  engine: vllm
+  dtype: bfloat16
+  lora_dtype: bfloat16
+  data_parallel_size: 8
+  tensor_parallel_size: 1
+  language_model_only: true
+  episode_concurrency: 221
+  max_num_seqs: 256
+  max_num_batched_tokens: 65536
+  gpu_memory_utilization: 0.90
+  max_model_len: 32768
+  max_prompt_tokens: 16384
+  max_output_tokens: 16384
+  thinking_budget: 4096
+  enable_thinking: true
+  include_thoughts: true
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64
+  seed: 42
+
+# One multi-turn episode/task; independent executable tests determine pass@1.
+# Complete prompts/responses, thoughts, tools, patches and test artifacts retained.
 generation_validation:
   status: existing_dev_selection_explicitly_enabled
   allow_dev_selection: true
   every_steps: 20
   panel: existing_225_dev_221_qualified
+  full_dataset: true
+  max_tasks: null
+  include_untuned_step_zero: true
+  selection_metric: independently_tested_solved_count
+  tie_break: earlier_checkpoint
+  patience: 3
+  nll_diagnostic_only: true
   max_wall_seconds: 3600
+  episode:
+    max_minutes: 5
+    max_tools: 60
+    max_turns: 60
+  grading:
+    workers: 8
+    max_grade_attempts: 3
+    reroll_predictions: false
   driver:
+    _target_: verl.trainer.generation_sft.NativePhases
+    training_python: ${oc.env:VERL_TRAIN_PYTHON,python}
     evaluator:
       _target_: verl.extensions.gemma.swe_dev.SWEDevEvaluator
       project_root: ${oc.env:GEMMA_PROJECT_ROOT}
@@ -26,9 +121,32 @@ generation_validation:
       baseline_report: outputs/runtime/baseline-completion-direct-dp8-20261026/verified-baseline-full221.json
       protocol: outputs/eval/e4b-sft-official-native-dp8-20261026-attempt-002/protocol.json
 
+checkpoint:
+  save_contents: [model, optimizer, extra]
+  load_contents: ${checkpoint.save_contents}
+  save_lora_only: true
+
 trainer:
+  project_name: gemma-sft
   experiment_name: e4b-lora-dev-generation-v1-20261027
   default_local_dir: ${oc.env:GEMMA_RUN_ROOT}/checkpoints
   default_hdfs_dir: null
-  test_freq: ${generation_validation.every_steps}
+  total_epochs: 1
+  total_training_steps: 157
+  n_gpus_per_node: 8
+  seed: 20261026
+  logger: [console]
+  save_freq: ${generation_validation.every_steps}
+  test_freq: ${generation_validation.every_steps} # Auxiliary NLL; not checkpoint selection.
   token_weighted_validation: true
+  resume_mode: disable
+  max_ckpt_to_keep: null
+  callbacks:
+    - _target_: verl.extensions.gemma.callbacks.SelectedHead
+      fp32_lm_head: true
+    - _target_: verl.extensions.gemma.callbacks.ExportAdapter
+      dtype: ${generation_inference.lora_dtype}
+
+workflow:
+  execute: false # CLI workflow.execute=true starts; otherwise print the plan.
+  max_wall_seconds: 86400
