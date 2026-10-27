@@ -6,7 +6,15 @@ Generation evaluation runs after the entire training process has exited. A phase
 boundary does not change the optimizer's total training steps or LR schedule.
 """
 
+from time import perf_counter
+
 from hydra.utils import instantiate
+
+
+def synchronized_time(device):
+    """Read a wall clock only after pending accelerator work has completed."""
+    device.synchronize()
+    return perf_counter()
 
 
 def build_callbacks(configs):

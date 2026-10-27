@@ -31,12 +31,12 @@ from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from verl.trainer.sft_extensions import build_callbacks, notify, phase_stop_step, validate_launch
+from verl.trainer.sft_extensions import build_callbacks, notify, phase_stop_step, synchronized_time, validate_launch
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint import CheckpointHandler
 from verl.utils.dataset.dataset_utils import SFTTensorCollator
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
-from verl.utils.device import auto_set_device, get_device_name
+from verl.utils.device import auto_set_device, get_device_name, get_torch_device
 from verl.utils.distributed import destroy_global_process_group
 from verl.utils.logger import log_with_rank
 from verl.utils.memory_utils import aggressive_empty_cache
@@ -376,6 +376,7 @@ class SFTTrainer:
                 )
             ):
                 global_step += 1
+                step_started = synchronized_time(get_torch_device())
 
                 # construct tensordict
                 data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
@@ -398,8 +399,14 @@ class SFTTrainer:
                 if global_step == self.end_profile_step:
                     self.training_client.stop_profile()
 
+                # Optimizer-update wall time includes completed device work,
+                # but excludes validation and checkpoint writes below.
+                step_seconds = synchronized_time(get_torch_device()) - step_started
+                train_time += step_seconds
+
                 if self.engine.is_mp_src_rank_with_outputs():
                     metrics = tu.get(output, "metrics")
+                    metrics["perf/step_time_seconds"] = step_seconds
 
                     # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
                     for k in ["loss", "grad_norm", "lr", "mfu"]:

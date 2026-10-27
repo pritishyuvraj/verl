@@ -8,6 +8,8 @@
 | Config groups | `gemma_model`, `gemma_data`, `generation_validation`, `generation_inference` |
 | Gemma integration | [`verl/extensions/gemma`](verl/extensions/gemma); canonical masks, selected head, PEFT export |
 | Adapter precision | BF16 inference export; FP32 optimizer/master checkpoint retained; evaluation must use the exact exported file |
+| Step timing | `perf/step_time_seconds`; synchronized optimizer-update wall time; excludes validation and checkpoint writes |
+| TensorBoard auto-refresh | Settings → Reload data → 30 seconds; backend event reload remains separate |
 | Phase boundary | `trainer.stop_after_step`; native optimizer/RNG/dataloader checkpoint; fixed LR horizon |
 | Batch size | Global32 = eight GPUs × microbatch1 × accumulation4 |
 | Generation validation | Every20 updates; full qualified held-out panel; native vLLM DP8/TP1; independent executable-test grading |
