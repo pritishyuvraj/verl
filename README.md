@@ -7,6 +7,7 @@
 | Hydra recipe | [`gemma_sft.yaml`](verl/trainer/config/gemma_sft.yaml) |
 | Config groups | `gemma_model`, `gemma_data`, `generation_validation`, `generation_inference` |
 | Gemma integration | [`verl/extensions/gemma`](verl/extensions/gemma); canonical masks, selected head, PEFT export |
+| Adapter precision | BF16 inference export; FP32 optimizer/master checkpoint retained; evaluation must use the exact exported file |
 | Phase boundary | `trainer.stop_after_step`; native optimizer/RNG/dataloader checkpoint; fixed LR horizon |
 | Batch size | Global32 = eight GPUs × microbatch1 × accumulation4 |
 | Generation validation | Every20 updates; full qualified held-out panel; native vLLM DP8/TP1; independent executable-test grading |
@@ -14,7 +15,7 @@
 | Qualification | Real SWE evaluator/panel still missing; default plan starts no job; execution refuses missing inputs |
 | Native NLL | `trainer.test_freq=-1` disables NLL; `generation_validation.every_steps=20` controls actual generation validation |
 | RL | Upstream [`main_ppo.py`](verl/trainer/main_ppo.py) retained; Gemma rollout/reward integration unqualified |
-| Verification | 40 CPU tests on Hor; 29 local checks; two heavy-runtime modules skipped locally; no GPU run |
+| Verification | 44 CPU tests on Hor; 29 local checks; two heavy-runtime modules skipped locally; no GPU run |
 
 Inspect/override the complete recipe without launching training:
 

@@ -1,5 +1,7 @@
 # Recorded successful serving capacity; occupancy depends on the admitted panel size.
 engine: vllm
+dtype: bfloat16
+lora_dtype: bfloat16
 data_parallel_size: 8
 tensor_parallel_size: 1
 language_model_only: true

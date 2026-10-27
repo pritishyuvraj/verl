@@ -43,6 +43,8 @@ generation_validation:
 
 generation_inference:
   engine: vllm
+  dtype: bfloat16
+  lora_dtype: bfloat16
   data_parallel_size: 8
   tensor_parallel_size: 1
   language_model_only: true
@@ -109,3 +111,4 @@ trainer:
     - _target_: verl.extensions.gemma.callbacks.SelectedHead
       fp32_lm_head: true
     - _target_: verl.extensions.gemma.callbacks.ExportAdapter
+      dtype: ${generation_inference.lora_dtype}

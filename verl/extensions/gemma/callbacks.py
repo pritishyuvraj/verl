@@ -25,6 +25,11 @@ class ExportAdapter:
     The separate adapter directory is for inference, never optimizer recovery.
     """
 
+    def __init__(self, dtype="bfloat16"):
+        if dtype not in ("bfloat16", "float32"):
+            raise ValueError("Adapter export dtype must be bfloat16 or float32")
+        self.dtype = dtype
+
     def on_checkpoint(self, trainer, step, checkpoint_path):
         import torch
         import torch.distributed as dist
@@ -51,6 +56,13 @@ class ExportAdapter:
                 adapter = get_peft_model_state_dict(module, state_dict=state)
                 if not adapter or not all(torch.isfinite(value).all() for value in adapter.values()):
                     raise ValueError("Empty or nonfinite adapter export")
+                # Cast only the inference copy. Native optimizer/master state is
+                # preserved at training precision for the next resume phase.
+                adapter = {
+                    name: value.to(dtype=getattr(torch, self.dtype)).contiguous() for name, value in adapter.items()
+                }
+                if not all(torch.isfinite(value).all() for value in adapter.values()):
+                    raise ValueError("Nonfinite adapter after export dtype conversion")
                 with tempfile.TemporaryDirectory(prefix=".adapter-", dir=checkpoint_path) as temporary:
                     path = Path(temporary)
                     save_file(adapter, path / "adapter_model.safetensors", metadata={"format": "pt"})

@@ -68,6 +68,8 @@ def test_sampling_and_generation_selection_contract():
     assert (inference.temperature, inference.top_p, inference.top_k) == (1.0, 0.95, 64)
     assert (inference.max_model_len, inference.max_output_tokens, inference.thinking_budget) == (32768, 16384, 4096)
     assert inference.language_model_only and inference.include_thoughts and inference.enable_thinking
+    assert inference.dtype == inference.lora_dtype == "bfloat16"
+    assert config.trainer.callbacks[-1].dtype == inference.lora_dtype
     assert config.generation_validation.selection_metric == "independently_tested_solved_count"
     assert config.generation_validation.include_untuned_step_zero
     assert config.generation_validation.nll_diagnostic_only
