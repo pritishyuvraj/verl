@@ -1,0 +1,14 @@
+# Pre-rendered audited input_ids/loss_mask parquet, not raw chat messages.
+train_files: ???
+val_files: null
+train_batch_size: 32
+micro_batch_size_per_gpu: 1
+max_length: 32768
+max_token_len_per_gpu: 32768
+pad_mode: no_padding
+truncation: error
+use_dynamic_bsz: false
+num_workers: 0
+custom_cls:
+  path: pkg://verl.extensions.gemma.dataset
+  name: GemmaMaskedSFTDataset

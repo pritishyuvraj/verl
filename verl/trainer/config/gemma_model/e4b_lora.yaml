@@ -1,0 +1,12 @@
+# Merge into the native HFModelConfig; no replacement model/optimizer implementation.
+path: ???
+tokenizer_path: ???
+override_config:
+  attn_implementation: sdpa
+use_remove_padding: false
+use_fused_kernels: false
+use_liger: false
+enable_gradient_checkpointing: true
+lora_rank: 32
+lora_alpha: 64
+target_modules: '.*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'

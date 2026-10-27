@@ -1,0 +1,53 @@
+# Native trainer recipe; model/data paths must be supplied explicitly.
+# Historical optimizer values are a migration template, not a recommended new run.
+# Generation settings describe the external evaluation phase. No panel is yet
+# execution-qualified; do not launch new training until that integration passes.
+defaults:
+  - sft_trainer_engine
+  - gemma_model@model: e4b_lora
+  - gemma_data@data: canonical_tokens
+  - generation_validation: swe_heldout
+  - generation_inference: vllm_dp8
+  - _self_
+
+engine:
+  strategy: fsdp2
+  model_dtype: fp32
+  use_torch_compile: false
+  ulysses_sequence_parallel_size: 1
+  use_no_sync_for_gradient_accumulation: false
+  seed: ${trainer.seed}
+  mixed_precision:
+    param_dtype: bf16
+    reduce_dtype: fp32
+    buffer_dtype: fp32
+
+optim:
+  lr: 5.0e-5
+  weight_decay: 0.0
+  lr_warmup_steps_ratio: 0.03
+  lr_scheduler_type: cosine
+  min_lr_ratio: 0.1
+  clip_grad: 1.0
+
+checkpoint:
+  save_contents: [model, optimizer, extra]
+  load_contents: ${checkpoint.save_contents}
+  save_lora_only: true
+
+trainer:
+  project_name: gemma-sft
+  experiment_name: generation-selected
+  total_epochs: 1
+  total_training_steps: 157
+  n_gpus_per_node: 8
+  seed: 20261026
+  logger: [console]
+  save_freq: 10
+  test_freq: -1
+  resume_mode: disable
+  max_ckpt_to_keep: null
+  callbacks:
+    - _target_: verl.extensions.gemma.callbacks.SelectedHead
+      fp32_lm_head: true
+    - _target_: verl.extensions.gemma.callbacks.ExportAdapter

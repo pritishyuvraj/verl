@@ -63,6 +63,12 @@ trainer:
   experiment_name: test
   total_epochs: 4
   total_training_steps: null
+
+  # Checkpoint and exit this process at a validation boundary; LR horizon stays fixed.
+  stop_after_step: null
+
+  # Optional Hydra-instantiated hooks: on_train_start / on_checkpoint (all ranks).
+  callbacks: []
   logger: [ 'console', 'wandb' ]
   seed: 1
   save_freq: -1

@@ -1,0 +1,19 @@
+# Recorded successful serving capacity; occupancy depends on the admitted panel size.
+engine: vllm
+data_parallel_size: 8
+tensor_parallel_size: 1
+language_model_only: true
+gpu_memory_utilization: 0.90
+max_num_seqs: 256
+max_num_batched_tokens: 65536
+episode_concurrency: 221
+max_model_len: 32768
+max_prompt_tokens: 16384
+max_output_tokens: 16384
+thinking_budget: 4096
+enable_thinking: true
+include_thoughts: true
+temperature: 1.0
+top_p: 0.95
+top_k: 64
+seed: 42

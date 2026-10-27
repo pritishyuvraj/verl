@@ -31,6 +31,7 @@ from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
+from verl.trainer.sft_extensions import build_callbacks, notify, phase_stop_step, validate_launch
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint import CheckpointHandler
 from verl.utils.dataset.dataset_utils import SFTTensorCollator
@@ -71,6 +72,11 @@ class SFTTrainer:
 
         # Initialize resume-related variables
         self.resume_global_step = self.ckpt_handler.load_checkpoint()
+
+        self.stop_after_step = phase_stop_step(
+            self.resume_global_step, self.total_training_steps, self.config.trainer.get("stop_after_step")
+        )
+        self.callbacks = build_callbacks(self.config.trainer.get("callbacks", []))
 
         self.device_name = self.config.trainer.device
 
@@ -306,6 +312,7 @@ class SFTTrainer:
         return batch_seqlens
 
     def fit(self):
+        notify(self.callbacks, "on_train_start", trainer=self)
         is_logging = self.engine.is_mp_src_rank_with_outputs() and self.engine.get_data_parallel_rank() == 0
 
         # TODO: add a unified tracking
@@ -409,9 +416,9 @@ class SFTTrainer:
                     if self.engine.get_data_parallel_rank() == 0:
                         tracking.log(data=metrics, step=global_step)
 
-                is_last_step = global_step >= self.total_training_steps
-                is_valid_step = global_step % self.test_freq == 0
-                is_save_step = global_step % self.save_freq == 0
+                is_last_step = global_step >= self.stop_after_step
+                is_valid_step = self.test_freq > 0 and global_step % self.test_freq == 0
+                is_save_step = self.save_freq > 0 and global_step % self.save_freq == 0
 
                 # early exit or validation step
                 if is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step):
@@ -441,6 +448,15 @@ class SFTTrainer:
                 if is_last_step or (self.save_freq > 0 and is_save_step):
                     aggressive_empty_cache(force_sync=True)
                     self.ckpt_handler.save_checkpoint(step=global_step)
+                    notify(
+                        self.callbacks,
+                        "on_checkpoint",
+                        trainer=self,
+                        step=global_step,
+                        checkpoint_path=os.path.join(
+                            self.config.trainer.default_local_dir, f"global_step_{global_step}"
+                        ),
+                    )
 
                 if is_last_step:
                     if is_logging:
@@ -452,10 +468,13 @@ class SFTTrainer:
 def run_sft(config):
     from verl.utils.distributed import initialize_global_process_group
 
+    validate_launch(config)
     initialize_global_process_group()
-    trainer = SFTTrainer(config=config)
-    trainer.fit()
-    destroy_global_process_group()
+    try:
+        trainer = SFTTrainer(config=config)
+        trainer.fit()
+    finally:
+        destroy_global_process_group()
 
 
 @hydra.main(config_path="config", config_name="sft_trainer_engine", version_base=None)

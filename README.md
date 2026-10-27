@@ -1,3 +1,28 @@
+## Gemma fork
+
+| Component | Location / status |
+|---|---|
+| Upstream base | `3c6d9b43b67c74ec343d77874cd8fa6e841523da`; later upstream changes remain separate |
+| SFT | Native `verl.trainer.sft_trainer`; no copied fit loop |
+| Hydra recipe | [`gemma_sft.yaml`](verl/trainer/config/gemma_sft.yaml) |
+| Config groups | `gemma_model`, `gemma_data`, `generation_validation`, `generation_inference` |
+| Gemma integration | [`verl/extensions/gemma`](verl/extensions/gemma); canonical masks, selected head, PEFT export |
+| Phase boundary | `trainer.stop_after_step`; native optimizer/RNG/dataloader checkpoint; fixed LR horizon |
+| Generation validation | Configuration and phase hooks only; qualified panel and orchestration pending; recipe blocks training |
+| RL | Upstream [`main_ppo.py`](verl/trainer/main_ppo.py) retained; Gemma rollout/reward integration unqualified |
+| Verification | 25 CPU tests on Hor; 14 local checks; two heavy-runtime modules skipped locally; no GPU run |
+
+Inspect/override the complete recipe without launching training:
+
+```bash
+python -m verl.trainer.sft_trainer --config-name gemma_sft --cfg job \
+  optim.lr=2e-5 model.lora_rank=32 data.train_batch_size=32 \
+  generation_inference.episode_concurrency=128 generation_validation.patience=3
+```
+
+Native `sft_trainer_engine` remains available for other models. Gemma-specific
+head hooks support SFT only; they must not be enabled for PPO/RL losses.
+
 <div align="center">
  👋 Hi, everyone!
     verl is a RL training library initiated by <b>ByteDance Seed team</b> and maintained by the verl community.
