@@ -1,8 +1,14 @@
 # External save/exit/generate/grade/resume phase; never run beside FSDP on the same GPUs.
-# Configuration contract only: panel qualification and process orchestration remain pending.
-status: integration_pending
+# generation_sft owns the phase schedule; an execution-qualified SWE driver is required.
+status: panel_and_driver_pending
 panel: null
-every_steps: 10
+driver:
+  _target_: verl.trainer.generation_sft.NativePhases
+  training_python: ${oc.env:VERL_TRAIN_PYTHON,python}
+  evaluator: null
+every_steps: 20
+full_dataset: true
+max_tasks: null
 include_untuned_step_zero: true
 selection_metric: independently_tested_solved_count
 tie_break: earlier_checkpoint

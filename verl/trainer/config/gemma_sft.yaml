@@ -1,7 +1,7 @@
 # Native trainer recipe; model/data paths must be supplied explicitly.
 # Historical optimizer values are a migration template, not a recommended new run.
-# Generation settings describe the external evaluation phase. No panel is yet
-# execution-qualified; do not launch new training until that integration passes.
+# Run through verl.trainer.generation_sft for save/exit/evaluate/resume.
+# No held-out panel is yet qualified; --cfg job is inspection only.
 defaults:
   - sft_trainer_engine
   - gemma_model@model: e4b_lora
@@ -9,6 +9,61 @@ defaults:
   - generation_validation: swe_heldout
   - generation_inference: vllm_dp8
   - _self_
+
+data:
+  # Effective batch = 8 GPUs x microbatch 1 x accumulation 4 = 32 examples.
+  train_batch_size: 32
+  micro_batch_size_per_gpu: 1
+  use_dynamic_bsz: false
+  pad_mode: no_padding
+  max_length: 32768
+
+generation_validation:
+  # Full generation + executable-test evaluation after every 20 optimizer updates.
+  every_steps: 20
+  full_dataset: true
+  max_tasks: null
+  # Required qualified held-out task manifest, disjoint from final evaluation.
+  panel: null
+  max_wall_seconds: 3600
+  episode:
+    max_minutes: 5
+    max_tools: 60
+    max_turns: 60
+  grading:
+    workers: 8
+    max_grade_attempts: 3
+    reroll_predictions: false
+  # Driver must qualify the held-out panel, generate patches, grade, and clean up.
+  # It is deliberately unset until the actual SWE adapter/panel is qualified.
+  driver:
+    _target_: verl.trainer.generation_sft.NativePhases
+    training_python: ${oc.env:VERL_TRAIN_PYTHON,python}
+    evaluator: null
+
+generation_inference:
+  engine: vllm
+  data_parallel_size: 8
+  tensor_parallel_size: 1
+  language_model_only: true
+  episode_concurrency: 221
+  max_num_seqs: 256
+  max_num_batched_tokens: 65536
+  gpu_memory_utilization: 0.90
+  max_model_len: 32768
+  max_prompt_tokens: 16384
+  max_output_tokens: 16384
+  thinking_budget: 4096
+  enable_thinking: true
+  include_thoughts: true
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64
+
+workflow:
+  # Planning is the default; this configuration change launches no training.
+  execute: false
+  max_wall_seconds: 86400
 
 engine:
   strategy: fsdp2
@@ -43,7 +98,10 @@ trainer:
   n_gpus_per_node: 8
   seed: 20261026
   logger: [console]
-  save_freq: 10
+  # Resolves to 20. Native save includes model, optimizer, RNG and dataloader state.
+  save_freq: ${generation_validation.every_steps}
+  # Native verl test_freq runs teacher-forced NLL, not generated SWE patches.
+  # Generation frequency is generation_validation.every_steps=20 above.
   test_freq: -1
   resume_mode: disable
   max_ckpt_to_keep: null

@@ -8,20 +8,29 @@
 | Config groups | `gemma_model`, `gemma_data`, `generation_validation`, `generation_inference` |
 | Gemma integration | [`verl/extensions/gemma`](verl/extensions/gemma); canonical masks, selected head, PEFT export |
 | Phase boundary | `trainer.stop_after_step`; native optimizer/RNG/dataloader checkpoint; fixed LR horizon |
-| Generation validation | Configuration and phase hooks only; qualified panel and orchestration pending; recipe blocks training |
+| Batch size | Global32 = eight GPUs × microbatch1 × accumulation4 |
+| Generation validation | Every20 updates; full qualified held-out panel; native vLLM DP8/TP1; independent executable-test grading |
+| Controller | [`generation_sft.py`](verl/trainer/generation_sft.py); checkpoint → training exit → GPU release → generation/tests → cleanup → resume |
+| Qualification | Real SWE evaluator/panel still missing; default plan starts no job; execution refuses missing inputs |
+| Native NLL | `trainer.test_freq=-1` disables NLL; `generation_validation.every_steps=20` controls actual generation validation |
 | RL | Upstream [`main_ppo.py`](verl/trainer/main_ppo.py) retained; Gemma rollout/reward integration unqualified |
-| Verification | 25 CPU tests on Hor; 14 local checks; two heavy-runtime modules skipped locally; no GPU run |
+| Verification | 40 CPU tests on Hor; 29 local checks; two heavy-runtime modules skipped locally; no GPU run |
 
 Inspect/override the complete recipe without launching training:
 
 ```bash
-python -m verl.trainer.sft_trainer --config-name gemma_sft --cfg job \
+python -m verl.trainer.generation_sft --config-name gemma_sft --cfg job \
   optim.lr=2e-5 model.lora_rank=32 data.train_batch_size=32 \
   generation_inference.episode_concurrency=128 generation_validation.patience=3
 ```
 
 Native `sft_trainer_engine` remains available for other models. Gemma-specific
 head hooks support SFT only; they must not be enabled for PPO/RL losses.
+
+Running `python -m verl.trainer.generation_sft` prints the phase plan. Execution
+requires `workflow.execute=true` plus a qualified panel and evaluator implementing
+the documented driver API. The controller has CPU lifecycle tests; no physical
+FSDP-to-vLLM handoff or real SWE validation has been qualified for training.
 
 <div align="center">
  👋 Hi, everyone!

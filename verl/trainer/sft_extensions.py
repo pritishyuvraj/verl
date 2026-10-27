@@ -32,9 +32,9 @@ def phase_stop_step(resume_step, total_steps, stop_after_step=None):
 def validate_launch(config):
     validation = config.get("generation_validation")
     if validation is not None:
-        # This recipe is a configuration/API migration, not a qualified SWE
-        # validation driver. Fail before distributed/model initialization.
+        # Workers receive a resolved native phase config from the controller;
+        # direct invocation cannot release GPUs and perform the eval lifecycle.
         raise RuntimeError(
-            "Generation-validation orchestration and held-out panel qualification are pending; "
-            "this Gemma recipe is configuration-only. Use --cfg job to inspect it."
+            "Use verl.trainer.generation_sft for the generation validation lifecycle; "
+            "direct native training is blocked. Held-out panel/driver qualification are pending."
         )
