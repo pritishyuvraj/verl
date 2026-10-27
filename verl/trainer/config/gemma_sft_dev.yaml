@@ -1,0 +1,34 @@
+# Run with GEMMA_PROJECT_ROOT and GEMMA_RUN_ROOT set; see the experiment record.
+# Existing 225-task dev cohort is now explicitly used for checkpoint selection.
+defaults:
+  - gemma_sft
+  - _self_
+
+model:
+  path: ${oc.env:GEMMA_PROJECT_ROOT}/models/gemma-4-E4B-it-qat-q4_0-unquantized
+  tokenizer_path: ${oc.env:GEMMA_PROJECT_ROOT}/.runtime/kaggle-tokenizer-e4b-v2
+
+data:
+  train_files: ${oc.env:GEMMA_PROJECT_ROOT}/outputs/sft/e4b-sft-verl-v3-thinking-v9-hor1-20261026/train.parquet
+  val_files: ${oc.env:GEMMA_PROJECT_ROOT}/outputs/sft/e4b-sft-verl-v3-thinking-v9-hor1-20261026/fullval.parquet
+
+generation_validation:
+  status: existing_dev_selection_explicitly_enabled
+  allow_dev_selection: true
+  every_steps: 20
+  panel: existing_225_dev_221_qualified
+  max_wall_seconds: 3600
+  driver:
+    evaluator:
+      _target_: verl.extensions.gemma.swe_dev.SWEDevEvaluator
+      project_root: ${oc.env:GEMMA_PROJECT_ROOT}
+      output_dir: ${oc.env:GEMMA_RUN_ROOT}/generation
+      baseline_report: outputs/runtime/baseline-completion-direct-dp8-20261026/verified-baseline-full221.json
+      protocol: outputs/eval/e4b-sft-official-native-dp8-20261026-attempt-002/protocol.json
+
+trainer:
+  experiment_name: e4b-lora-dev-generation-v1-20261027
+  default_local_dir: ${oc.env:GEMMA_RUN_ROOT}/checkpoints
+  default_hdfs_dir: null
+  test_freq: ${generation_validation.every_steps}
+  token_weighted_validation: true

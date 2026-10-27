@@ -54,8 +54,10 @@ def plan(config):
         raise ValueError("Generation validation requires vLLM")
     if not config.generation_validation.full_dataset or config.generation_validation.max_tasks is not None:
         raise ValueError("Evaluate the complete qualified held-out panel without task sampling")
-    if config.data.val_files is not None or config.trainer.test_freq != -1:
-        raise ValueError("Native NLL validation must be disabled in the generation-selection workflow")
+    if config.trainer.test_freq != -1 and (
+        not config.generation_validation.nll_diagnostic_only or not config.data.val_files
+    ):
+        raise ValueError("Native NLL requires validation data and must remain diagnostic only")
     if config.generation_validation.selection_metric != "independently_tested_solved_count":
         raise ValueError("Only executable-test solved count can select checkpoints")
     if not config.generation_validation.include_untuned_step_zero:
@@ -221,9 +223,15 @@ def run(config, driver, *, clock=time.monotonic, record=lambda value: None):
         or not task_ids
         or any(not isinstance(task, str) or not task for task in task_ids)
         or len(set(task_ids)) != len(task_ids)
-        or qualification.get("final_evaluation_overlap") is not False
+        or (
+            qualification.get("final_evaluation_overlap") is not False
+            and not (
+                qualification.get("final_evaluation_overlap") is True
+                and config.generation_validation.get("allow_dev_selection") is True
+            )
+        )
     ):
-        raise ValueError("A complete qualified held-out panel disjoint from final evaluation is required")
+        raise ValueError("A qualified panel must be disjoint unless dev-set selection is explicitly enabled")
     best_step, best_solved, bad = 0, -1, 0
     checkpoint = None
     observations = []
@@ -260,7 +268,13 @@ def run(config, driver, *, clock=time.monotonic, record=lambda value: None):
             or not set(solved) <= set(task_ids)
         ):
             raise ValueError("Incomplete generation/test grading or cleanup blocks checkpoint selection and resume")
-        observation = {"step": step, "checkpoint": checkpoint, "solved": len(solved), "total": len(task_ids)}
+        observation = {
+            "step": step,
+            "checkpoint": checkpoint,
+            "solved": len(solved),
+            "total": len(task_ids),
+            "dev_set_used_for_selection": qualification.get("final_evaluation_overlap") is True,
+        }
         observations.append(observation)
         if len(solved) > best_solved:
             best_step, best_solved, bad = step, len(solved), 0

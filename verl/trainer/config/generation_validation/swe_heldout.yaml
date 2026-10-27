@@ -14,6 +14,7 @@ selection_metric: independently_tested_solved_count
 tie_break: earlier_checkpoint
 patience: 3
 nll_diagnostic_only: true
+allow_dev_selection: false
 max_wall_seconds: 3600
 episode:
   max_minutes: 5

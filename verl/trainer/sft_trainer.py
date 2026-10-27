@@ -424,20 +424,34 @@ class SFTTrainer:
                 if is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step):
                     # Perform validation
                     val_losses = []
+                    weighted_nll = torch.zeros(2, dtype=torch.float64, device=self.device_name)
+                    weighted = self.config.trainer.get("token_weighted_validation", False)
                     for val_data in self.val_dataloader:
                         val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
+                        if weighted:
+                            count = val_data["loss_mask"].sum().to(self.device_name)
+                            torch.distributed.all_reduce(count, group=self.engine.get_data_parallel_group())
                         output = self.training_client.infer_batch(val_data)
 
                         if self.engine.is_mp_src_rank_with_outputs():
                             metrics = tu.get(output, "metrics")
                             val_losses.append(metrics["loss"])
+                            if weighted:
+                                weighted_nll[0] += metrics["loss"] * count
+                                weighted_nll[1] += count
 
                     if self.engine.is_mp_src_rank_with_outputs():
-                        val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
                         # average over data parallel group
                         dp_group = self.engine.get_data_parallel_group()
-                        if dp_group is not None:
-                            torch.distributed.all_reduce(val_loss, op=torch.distributed.ReduceOp.AVG, group=dp_group)
+                        if weighted:
+                            torch.distributed.all_reduce(weighted_nll, group=dp_group)
+                            val_loss = weighted_nll[0] / weighted_nll[1]
+                        else:
+                            val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
+                            if dp_group is not None:
+                                torch.distributed.all_reduce(
+                                    val_loss, op=torch.distributed.ReduceOp.AVG, group=dp_group
+                                )
 
                     if is_logging:
                         metric = {"val/loss": val_loss.detach().item()}
