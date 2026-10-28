@@ -311,6 +311,52 @@ class SFTTrainer:
         batch_seqlens = output_tensor.tolist()
         return batch_seqlens
 
+    def validate(self, meta_info):
+        """Token-weighted NLL plus optional distribution diagnostics; never selection."""
+        import math
+
+        val_losses = []
+        weighted_nll = torch.zeros(2, dtype=torch.float64, device=self.device_name)
+        weighted = self.config.trainer.get("token_weighted_validation", False)
+        entropy_enabled = self.config.trainer.get("validation_entropy", False)
+        if entropy_enabled:
+            self.engine._gemma_entropy_totals = None
+        dp_group = self.engine.get_data_parallel_group()
+        for val_data in self.val_dataloader:
+            val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
+            if weighted:
+                count = val_data["loss_mask"].sum().to(self.device_name)
+                torch.distributed.all_reduce(count, group=dp_group)
+            output = self.training_client.infer_batch(val_data)
+            if self.engine.is_mp_src_rank_with_outputs():
+                metrics = tu.get(output, "metrics")
+                val_losses.append(metrics["loss"])
+                if weighted:
+                    weighted_nll[0] += metrics["loss"] * count
+                    weighted_nll[1] += count
+        metric = {}
+        if self.engine.is_mp_src_rank_with_outputs():
+            if weighted:
+                torch.distributed.all_reduce(weighted_nll, group=dp_group)
+                val_loss = (weighted_nll[0] / weighted_nll[1]).item()
+            else:
+                value = torch.mean(torch.tensor(val_losses, device=self.device_name))
+                if dp_group is not None:
+                    torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.AVG, group=dp_group)
+                val_loss = value.item()
+            metric["val/loss"] = val_loss
+            metric["val/perplexity"] = math.exp(val_loss) if val_loss < 709 else float("inf")
+            if entropy_enabled:
+                totals = getattr(self.engine, "_gemma_entropy_totals", None)
+                if totals is None:
+                    raise RuntimeError("Entropy requested but no validated entropy recorder was installed")
+                torch.distributed.all_reduce(totals, group=dp_group)
+                if totals[1] <= 0:
+                    raise RuntimeError("No supervised entropy tokens")
+                metric["val/entropy_nats"] = (totals[0] / totals[1]).item()
+                metric["val/supervised_tokens"] = totals[1].item()
+        return metric
+
     def fit(self):
         notify(self.callbacks, "on_train_start", trainer=self)
         is_logging = self.engine.is_mp_src_rank_with_outputs() and self.engine.get_data_parallel_rank() == 0
@@ -357,6 +403,19 @@ class SFTTrainer:
             "pad_mode": self.config.data.pad_mode,
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
         }
+
+        if self.config.trainer.get("validation_only", False) or (
+            global_step == 0 and self.config.trainer.get("validate_before_train", False)
+        ):
+            if self.val_dataloader is None:
+                raise ValueError("Initial validation requires a validation dataset")
+            metric = self.validate(meta_info)
+            if is_logging:
+                tracking.log(data=metric, step=global_step)
+                last_valid_metric = metric
+            torch.distributed.barrier()
+            if self.config.trainer.get("validation_only", False):
+                return
 
         train_time = 0
         total_tokens = 0
@@ -429,39 +488,8 @@ class SFTTrainer:
 
                 # early exit or validation step
                 if is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step):
-                    # Perform validation
-                    val_losses = []
-                    weighted_nll = torch.zeros(2, dtype=torch.float64, device=self.device_name)
-                    weighted = self.config.trainer.get("token_weighted_validation", False)
-                    for val_data in self.val_dataloader:
-                        val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
-                        if weighted:
-                            count = val_data["loss_mask"].sum().to(self.device_name)
-                            torch.distributed.all_reduce(count, group=self.engine.get_data_parallel_group())
-                        output = self.training_client.infer_batch(val_data)
-
-                        if self.engine.is_mp_src_rank_with_outputs():
-                            metrics = tu.get(output, "metrics")
-                            val_losses.append(metrics["loss"])
-                            if weighted:
-                                weighted_nll[0] += metrics["loss"] * count
-                                weighted_nll[1] += count
-
-                    if self.engine.is_mp_src_rank_with_outputs():
-                        # average over data parallel group
-                        dp_group = self.engine.get_data_parallel_group()
-                        if weighted:
-                            torch.distributed.all_reduce(weighted_nll, group=dp_group)
-                            val_loss = weighted_nll[0] / weighted_nll[1]
-                        else:
-                            val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
-                            if dp_group is not None:
-                                torch.distributed.all_reduce(
-                                    val_loss, op=torch.distributed.ReduceOp.AVG, group=dp_group
-                                )
-
+                    metric = self.validate(meta_info)
                     if is_logging:
-                        metric = {"val/loss": val_loss.detach().item()}
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
                     torch.distributed.barrier()

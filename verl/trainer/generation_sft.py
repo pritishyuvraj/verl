@@ -275,6 +275,9 @@ def run(config, driver, *, clock=time.monotonic, record=lambda value: None):
             "total": len(task_ids),
             "dev_set_used_for_selection": qualification.get("final_evaluation_overlap") is True,
         }
+        for diagnostic in ("generation_seconds", "elapsed_seconds", "empty_patches", "mean_responses_per_task"):
+            if diagnostic in outcome:
+                observation[diagnostic] = outcome[diagnostic]
         observations.append(observation)
         if len(solved) > best_solved:
             best_step, best_solved, bad = step, len(solved), 0
@@ -312,6 +315,16 @@ def main(config):
         path = output / f"generation-history-{len(value['observations']):04d}.yaml"
         with path.open("x") as stream:
             OmegaConf.save(OmegaConf.create(value), stream)
+        if "tensorboard" in config.trainer.logger:
+            from torch.utils.tensorboard import SummaryWriter
+
+            row = value["observations"][-1]
+            with SummaryWriter(os.environ.get("TENSORBOARD_DIR", str(output.parent / "tensorboard"))) as writer:
+                writer.add_scalar("validation/solved", row["solved"], row["step"])
+                writer.add_scalar("validation/solved_rate", row["solved"] / row["total"], row["step"])
+                for key in ("generation_seconds", "elapsed_seconds", "empty_patches", "mean_responses_per_task"):
+                    if key in row:
+                        writer.add_scalar("validation/" + key, row[key], row["step"])
 
     print(json.dumps(run(config, driver, record=record)))
 

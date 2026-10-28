@@ -1,0 +1,192 @@
+# Hor-3 precision/LR experiment; fresh initialization. Execution requires qualified packed-base and remote grading paths.
+# Existing 225-task dev cohort (221 runnable) is explicitly used for selection.
+# Scores are development/selection scores, not an unbiased held-out estimate.
+# Launch from the fork checkout with GEMMA_PROJECT_ROOT and a NEW GEMMA_RUN_ROOT:
+# export VERL_TRAIN_PYTHON="$GEMMA_PROJECT_ROOT/.runtime/venvs/sft-verl/bin/python"
+# export PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 VERL_USE_EXTERNAL_PLUGINS=none
+# unset LD_LIBRARY_PATH NCCL_TOPO_FILE # hor-3 native driver590; no hor-1 compatibility libraries.
+# NCCL discovers hor-3 topology; do not reuse hor-1 hardware topology XML.
+# "$VERL_TRAIN_PYTHON" -m verl.trainer.generation_sft --config-name gemma_sft_hor3 workflow.execute=true
+# Status: preparation; this file alone does not start a GPU job.
+defaults:
+  - gemma_sft
+  - _self_
+
+# TRAINING MODEL: exact official packed INT4 integers/scales; no requantization.
+# Temporary per-layer BF16 dequantization supplies matmul and activation gradients.
+# Frozen embeddings/head/norms keep their official floating-point values.
+# FP32 LoRA masters, accumulated gradients and optimizer states; BF16 compute/export.
+model:
+  path: ${oc.env:GEMMA_PROJECT_ROOT}/.runtime/models/kaggle-e4b-v2
+  weight_loader: verl.extensions.gemma.packed_base.load_model
+  tokenizer_path: ${oc.env:GEMMA_PROJECT_ROOT}/.runtime/kaggle-tokenizer-e4b-v2
+  lora_rank: 32 # Low-rank dimension.
+  lora_alpha: 64 # LoRA multiplier alpha/r = 2.
+  # Attention Q/K/V/O and MLP gate/up/down; embeddings and vocabulary head stay frozen.
+  target_modules: '.*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+  enable_gradient_checkpointing: true # Recompute activations; unrelated to sequence packing.
+  use_remove_padding: false
+  use_fused_kernels: false
+  use_liger: false
+  override_config:
+    attn_implementation: sdpa
+
+# TRAINING DATA: audited v9, 5,000 windows / 1,777 issues; 4,962 Nebius + 38 SWE-smith.
+# Validation parquet: 947 windows, teacher-forced NLL diagnostic only.
+# Pre-rendered input_ids/loss_mask: selected assistant thoughts/actions/answers/end markers.
+# System/user/tool/unselected history is masked; loss divides by global supervised-token count.
+# Sequence packing DISABLED: one true-length window/microbatch, no fixed 32K padding.
+# Final incomplete global batch uses zero-loss filler rows, retaining all 5,000 windows.
+data:
+  train_files: ${oc.env:GEMMA_PROJECT_ROOT}/outputs/sft/e4b-sft-verl-v3-thinking-v9-hor1-20261026/train.parquet
+  val_files: ${oc.env:GEMMA_PROJECT_ROOT}/outputs/sft/e4b-sft-verl-v3-thinking-v9-hor1-20261026/fullval.parquet
+  train_batch_size: 32 # Global examples/update = 8 ranks x 1 example x 4 accumulation steps.
+  micro_batch_size_per_gpu: 1 # Per-rank examples/forward-backward; accumulation is derived.
+  max_length: 32768 # Maximum complete training window, not a padding target.
+  max_token_len_per_gpu: 32768
+  pad_mode: no_padding
+  truncation: error # Reject overlength records whole; never silently clip content.
+  use_dynamic_bsz: false
+  num_workers: 0
+
+# TRAINING DISTRIBUTION: eight FSDP2 ranks shard training state; sequence parallelism is 1.
+# BF16 computation; FP32 master parameters, reductions, buffers and selected vocabulary head.
+# AMP GradScaler is DISABLED automatically for BF16; only FP16 enables loss scaling.
+# Global supervised-token loss normalization above is separate from AMP loss scaling.
+engine:
+  strategy: fsdp2
+  model_dtype: fp32
+  use_torch_compile: false
+  ulysses_sequence_parallel_size: 1
+  use_no_sync_for_gradient_accumulation: false
+  seed: ${trainer.seed}
+  mixed_precision:
+    param_dtype: bf16
+    reduce_dtype: fp32
+    buffer_dtype: fp32
+
+# OPTIMIZER: PyTorch AdamW; epsilon=1e-8 remains its native default.
+# Warmup = floor(157 x 0.03) = 4 updates; cosine decay floor = 1e-6.
+# Logged train/grad_norm is the measured GLOBAL L2 norm BEFORE clipping.
+# Nonfinite gradient norms skip the optimizer update; they are not a clipping target.
+optim:
+  optimizer: AdamW
+  optimizer_impl: torch.optim
+  lr: 1.0e-5 # Peak; fivefold reduction from the prior run.
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+  lr_warmup_steps_ratio: 0.03
+  lr_scheduler_type: cosine
+  min_lr_ratio: 0.1
+  clip_grad: 1.0 # Maximum global L2 norm after clipping; not an expected measured norm.
+
+# GENERATION SERVING: training saves/exits; all eight GPUs then serve vLLM replicas.
+# Model: .runtime/models/kaggle-e4b-v2, official gemma-4-e4b-it-qat-w4a16-ct/2.
+# Runtime: .runtime/venvs/scorer-v31/bin/python; official wheelhouse31 / vLLM 0.19.1.
+# One full model per GPU; adapter is BF16. W4A16 base weights remain quantized.
+generation_inference:
+  engine: vllm
+  dtype: bfloat16 # Activation/compute dtype; does not dequantize the W4A16 base.
+  lora_dtype: bfloat16 # Exported inference adapter; native resumable training state stays FP32.
+  data_parallel_size: 8 # Native vLLM DP: eight model replicas on one eight-GPU node.
+  tensor_parallel_size: 1 # Each replica occupies one GPU.
+  language_model_only: true # Skip multimodal components for text/code tasks.
+  episode_concurrency: 128
+  episodes_per_rank: 16 # Fixed task-index modulo 8; no unequal rank queues.
+  # GLOBAL active multi-turn tasks; up to one ordinary request/task.
+  max_num_seqs: 256 # PER-REPLICA concurrent sequence capacity, not guaranteed occupancy.
+  max_num_batched_tokens: 65536 # PER-REPLICA scheduler token budget, not context length.
+  gpu_memory_utilization: 0.90 # vLLM memory planning fraction, not a hard allocation ceiling.
+  max_model_len: 131072 # Total prompt + generated context.
+  max_prompt_tokens: 114688 # Reserved-output generation-prefix allowance.
+  max_output_tokens: 16384 # TOTAL assistant output: thoughts + answer/tool call.
+  thinking_budget: 4096 # Thought allowance within the total output cap.
+  enable_thinking: true
+  include_thoughts: true
+  # Official Gemma sampling defaults; seed records RNG setup, not bitwise reproducibility.
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64
+  seed: 42
+
+# GENERATION VALIDATION: official organizer ADK run_agent_sandbox agent/tool loop.
+# Grading: official SWE-bench 4.1.0 executable tests in immutable per-task Docker images.
+# Environment/profile/source pins come from protocol.json and its verified fixture graph.
+# CPU tests stay on hor-1; no host-admission receipt is transferred to hor-3.
+# Dedicated Docker: unix:///dev/shm/pritish-gemma4-20261025/eval-docker/docker.sock.
+# Solver receives task/workspace/tools; gold patches/private tests are withheld.
+# One multi-turn rollout/task, one final patch: executable-test pass@1, no pass@k.
+# 225 dev tasks = 221 runnable + 4 preserved upstream environment exclusions.
+# This SAME dev cohort selects checkpoints: scores are selection scores, not held-out estimates.
+# Complete prompts/responses, thoughts, tools, patches and grading reports are retained.
+# Relaxed128K/60-minute protocol retains the recorded official summary exception.
+# Both fresh baseline and adapters use the exact same inference budgets.
+generation_validation:
+  status: existing_dev_selection_explicitly_enabled
+  allow_dev_selection: true
+  every_steps: 5 # Fresh step0, then5,10,15...155, plus157; patience may stop earlier.
+  panel: existing_225_dev_221_qualified
+  full_dataset: true
+  max_tasks: null
+  include_untuned_step_zero: true # Fresh baseline generation and NLL before any update.
+  selection_metric: independently_tested_solved_count # Primary selection signal; training/NLL loss is diagnostic.
+  tie_break: earlier_checkpoint
+  patience: 3 # Stop after three generation validations without another solved issue.
+  nll_diagnostic_only: true
+  max_wall_seconds: 14400 # Whole validation stage, including serving/generation/grading/cleanup.
+  episode:
+    max_minutes: 60 # Relaxed diagnostic profile, not Kaggle competition budgets.
+    max_tools: 60
+    max_turns: 60 # Multi-turn agent interaction limit; not independent attempts.
+  grading:
+    workers: 8 # CPU graders start as individual predictions become durable; overlap generation.
+    max_grade_attempts: 3 # Grade-only recovery of the SAME immutable prediction.
+    reroll_predictions: false # Never sample a replacement because an outcome failed.
+  driver:
+    _target_: verl.trainer.generation_sft.NativePhases
+    training_python: ${oc.env:VERL_TRAIN_PYTHON,python}
+    evaluator:
+      _target_: verl.extensions.gemma.remote_swe_dev.RemoteSWEDevEvaluator
+      project_root: ${oc.env:GEMMA_PROJECT_ROOT}
+      output_dir: ${oc.env:GEMMA_RUN_ROOT}/generation # Per-step requests/responses, trajectories, patches, reports.
+      cpu_host: ubuntu@213.181.122.146 # Existing qualified tools/tests on hor-1.
+      gpu_host: ubuntu@213.181.122.214 # All training/generation GPUs on hor-3.
+      cpu_project_root: /pritish/workspace/gemma-post-training-kaggle
+      baseline_report: outputs/runtime/baseline-completion-direct-dp8-20261026/verified-baseline-full221.json
+      protocol: outputs/eval/e4b-sft-official-native-dp8-20261026-attempt-002/protocol.json
+
+# RECOVERY: resumable model/optimizer/RNG/dataloader state plus portable BF16 adapter export.
+checkpoint:
+  save_contents: [model, optimizer, extra]
+  load_contents: ${checkpoint.save_contents}
+  save_lora_only: true
+
+trainer:
+  project_name: gemma-sft
+  experiment_name: e4b-packed-lora-lr1e5-hor3-20261028
+  default_local_dir: ${oc.env:GEMMA_RUN_ROOT}/checkpoints
+  default_hdfs_dir: null
+  total_epochs: 1
+  total_training_steps: 157 # ceil(5,000 / 32); native phase resumes preserve optimizer/scheduler state.
+  n_gpus_per_node: 8
+  seed: 20261026
+  logger: [console, tensorboard]
+  save_freq: ${generation_validation.every_steps} # Save/release GPUs before full generation validation.
+  test_freq: ${generation_validation.every_steps} # Auxiliary NLL; not checkpoint selection.
+  token_weighted_validation: true
+  validate_before_train: false # Dedicated step-zero process runs initial947-window NLL/PPL/entropy.
+  validation_only: false
+  validation_entropy: true # Full-vocabulary entropy on supervised positions; diagnostic, no regularizer.
+  resume_mode: disable
+  max_ckpt_to_keep: null # Retain checkpoint evidence until generation-based selection.
+  callbacks:
+    - _target_: verl.extensions.gemma.callbacks.SelectedHead
+      fp32_lm_head: true
+    - _target_: verl.extensions.gemma.callbacks.PackedPrecision
+    - _target_: verl.extensions.gemma.callbacks.ExportAdapter
+      dtype: ${generation_inference.lora_dtype}
+
+# Absolute workflow deadline and stop on failures; no silent relaunch or altered inference budgets.
+workflow:
+  execute: false # CLI workflow.execute=true starts; otherwise print the plan.
+  max_wall_seconds: 86400

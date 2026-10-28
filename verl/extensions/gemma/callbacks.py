@@ -16,6 +16,7 @@ class SelectedHead:
 
         torch.backends.cuda.matmul.allow_tf32 = False
         install_selected_head(trainer.engine, fp32_lm_head=self.fp32_lm_head)
+        trainer.engine._gemma_validation_entropy = trainer.config.trainer.get("validation_entropy", False)
 
 
 class ExportAdapter:
@@ -74,3 +75,35 @@ class ExportAdapter:
         dist.broadcast_object_list(error, src=0)
         if error[0] is not None:
             raise RuntimeError(f"Portable adapter export failed: {error[0]}")
+
+
+class PackedPrecision:
+    """Verify the live optimizer contract, including after native resume."""
+
+    def on_train_start(self, trainer):
+        import json
+        import torch
+
+        from .packed_base import FrozenPackedLinear
+
+        module = trainer.engine.module
+        packed = [m for m in module.modules() if isinstance(m, FrozenPackedLinear)]
+        trainable = [p for p in module.parameters() if p.requires_grad]
+        if not packed or not trainable or any(p.dtype != torch.float32 for p in trainable):
+            raise ValueError("Packed base and FP32 LoRA master contract not met")
+        if any(m.weight_packed.dtype != torch.int32 or m.weight_scale_bits.dtype != torch.uint8 for m in packed):
+            raise ValueError("Packed weight or original scale storage changed")
+        original = trainer.engine.optimizer_step
+        checked = [False]
+
+        def step():
+            gradients = [p.grad for p in trainable if p.grad is not None]
+            if not gradients or any(g.dtype != torch.float32 for g in gradients):
+                raise ValueError("LoRA gradients are not FP32 before optimizer update")
+            if not checked[0]:
+                print(json.dumps({"precision_verified_rank": trainer.rank, "master_dtype": "FP32",
+                                  "gradient_dtype": "FP32", "packed_layers": len(packed)}), flush=True)
+                checked[0] = True
+            return original()
+
+        trainer.engine.optimizer_step = step

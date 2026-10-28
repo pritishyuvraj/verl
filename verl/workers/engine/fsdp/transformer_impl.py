@@ -277,12 +277,19 @@ class FSDPEngine(BaseEngine):
             if self.model_config.model_type == "language_model":
                 auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
 
-                module = auto_class.from_pretrained(
-                    pretrained_model_name_or_path=self.model_config.local_path,
-                    torch_dtype=torch_dtype,
-                    config=self.model_config.hf_config,
-                    trust_remote_code=self.model_config.trust_remote_code,
-                )
+                if self.model_config.weight_loader is not None:
+                    from hydra.utils import get_method
+
+                    module = get_method(self.model_config.weight_loader)(
+                        auto_class=auto_class, model_config=self.model_config, dtype=torch_dtype
+                    )
+                else:
+                    module = auto_class.from_pretrained(
+                        pretrained_model_name_or_path=self.model_config.local_path,
+                        torch_dtype=torch_dtype,
+                        config=self.model_config.hf_config,
+                        trust_remote_code=self.model_config.trust_remote_code,
+                    )
 
                 # Strip sub-modules listed in _verl_strip_modules (e.g.
                 # talker / code2wav for Qwen3-Omni Thinker-only training).

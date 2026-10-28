@@ -112,6 +112,9 @@ class HFModelConfig(BaseConfig):
 
     external_lib: Any = None
 
+    # Optional checkpoint loader; receives auto_class, model_config and dtype.
+    weight_loader: Optional[str] = None
+
     override_config: dict = field(default_factory=dict)
 
     enable_gradient_checkpointing: bool = True

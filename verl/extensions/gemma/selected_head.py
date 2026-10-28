@@ -76,10 +76,31 @@ def _prepare_outputs(self, output, output_args, micro_batch, logits_processor_fu
         raise ValueError("Selected-head hooks accept only the stock SFT loss, not RL/distillation processors")
 
     positions = output_args["gemma_selected_positions"]
+    if not torch.is_grad_enabled() and getattr(self, "_gemma_validation_entropy", False):
+        mask = torch.roll(micro_batch["loss_mask"].values(), shifts=-1).index_select(0, positions).bool()
+        totals = entropy_totals(output.logits.squeeze(0), mask)
+        previous = getattr(self, "_gemma_entropy_totals", None)
+        self._gemma_entropy_totals = totals if previous is None else previous + totals
     log_probs = scatter_selected_logprobs(
         output.logits, output_args["input_ids_rmpad_rolled"], positions, logprobs_from_logits
     )
     return {"log_probs": torch.nested.nested_tensor_from_jagged(log_probs, output_args["gemma_full_offsets"])}
+
+
+def entropy_totals(logits, mask, chunk_rows=32):
+    """Full-vocabulary entropy over supervised positions, in nats; no loss term."""
+    import torch
+
+    with torch.no_grad():
+        result = torch.zeros(2, dtype=torch.float64, device=logits.device)
+        for start in range(0, logits.shape[0], chunk_rows):
+            selected = mask[start : start + chunk_rows]
+            if not selected.any():
+                continue
+            logp = torch.log_softmax(logits[start : start + chunk_rows][selected].float(), dim=-1)
+            result[0] += -(logp.exp() * logp).sum(dim=-1).double().sum()
+            result[1] += selected.sum()
+        return result
 
 
 def _fp32_head_forward(self, hidden):
