@@ -85,6 +85,8 @@ optim:
 # Runtime: .runtime/venvs/scorer-v31/bin/python; official wheelhouse31 / vLLM 0.19.1.
 # One full model per GPU; adapter is BF16. W4A16 base weights remain quantized.
 generation_inference:
+  # vLLM0.19.1 + upstream dbd86a67 (PR41991): prevents malformed-tool parser infinite loops.
+  tool_parser_sha256: 651552935ef25f55cc4439cd9a432bf813a76fe8353e41d8fd59167cd3316a45
   engine: vllm
   dtype: bfloat16 # Activation/compute dtype; does not dequantize the W4A16 base.
   lora_dtype: bfloat16 # Exported inference adapter; native resumable training state stays FP32.
@@ -134,6 +136,7 @@ generation_validation:
   patience: 3 # Stop after three generation validations without another solved issue.
   nll_diagnostic_only: true
   max_wall_seconds: 14400 # Whole validation stage, including serving/generation/grading/cleanup.
+  request_timeout_seconds: 600 # Transport guard; failure invalidates selection, never scores as model failure.
   episode:
     max_minutes: 60 # Relaxed diagnostic profile, not Kaggle competition budgets.
     max_tools: 60

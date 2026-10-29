@@ -100,6 +100,83 @@ def test_native_phase_exit_idle_full_eval_then_resume():
     ]
 
 
+def recovery_fixture(tmp_path, invalid_step=20):
+    import hashlib
+    import json
+
+    def save(name, value):
+        path = tmp_path / name
+        path.write_text(json.dumps(value))
+        return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    baseline = save("baseline.json", {"state": "completed", "step": 0,
+        "cleanup_complete": True, "task_ids": ["heldout-a", "heldout-b"],
+        "solved_task_ids": ["heldout-a"]})
+    invalid = save("invalid.json", {"state": "invalid_infrastructure", "step": invalid_step,
+        "reason": "API process made no progress; requests cancelled"})
+    return save("recovery.json", {"schema": 1, "pending_step": 40,
+        "checkpoint": "/native/global_step_40", "completed": [baseline], "invalidated": [invalid]})
+
+
+def test_recovery_does_not_retrain_or_reroll_and_ignores_invalid_patience(tmp_path):
+    from omegaconf import open_dict
+
+    config = recipe(["trainer.total_training_steps=40", "generation_validation.patience=1"])
+    with open_dict(config.workflow):
+        config.workflow.recovery = recovery_fixture(tmp_path)
+    driver = Driver(scores=(2,))
+    result = workflow.run(config, driver)
+    assert result["selected_step"] == 40
+    assert [r["step"] for r in result["observations"]] == [0, 40]
+    assert not any(e[0] == "train" for e in driver.events)
+    assert [e[1] for e in driver.events if e[0] == "eval"] == [40]
+    assert ("checkpoint", 40) in driver.events
+
+
+@pytest.mark.parametrize("damage", ["receipt", "result", "gap", "duplicate", "checkpoint", "cohort"])
+def test_recovery_rejects_changed_or_incomplete_history(tmp_path, damage):
+    import hashlib
+    import json
+
+    ref = recovery_fixture(tmp_path)
+    path = Path(ref["path"])
+    d = json.loads(path.read_text())
+    if damage == "receipt":
+        path.write_text("{}")
+    elif damage == "result":
+        Path(d["completed"][0]["path"]).write_text("{}")
+    else:
+        if damage == "gap":
+            d["invalidated"] = []
+        elif damage == "duplicate":
+            d["completed"] *= 2
+        elif damage == "checkpoint":
+            d["checkpoint"] = "/native/global_step_35"
+        elif damage == "cohort":
+            r = Path(d["completed"][0]["path"])
+            v = json.loads(r.read_text()); v["task_ids"] = ["other"]
+            r.write_text(json.dumps(v)); d["completed"][0]["sha256"] = hashlib.sha256(r.read_bytes()).hexdigest()
+        path.write_text(json.dumps(d)); ref["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError):
+        workflow.recovered_state(ref, ["heldout-a", "heldout-b"], [0, 20, 40])
+
+
+@pytest.mark.parametrize("row", [{"status": 200}, {"status": 500},
+    {"error_type": "TimeoutError"}, {"client_cancelled": True}])
+def test_transport_faults_block_selection(tmp_path, row):
+    import json
+    from verl.extensions.gemma.remote_swe_dev import verify_transport
+
+    p = tmp_path / "responses.jsonl"
+    p.write_text(json.dumps(row) + "\n")
+    if row == {"status": 200}:
+        verify_transport(p)
+    else:
+        with pytest.raises(RuntimeError, match="invalidate selection"):
+            verify_transport(p)
+        assert json.loads((tmp_path / "invalid-transport.json").read_text())["state"] == "invalid_infrastructure"
+
+
 def test_failed_eval_cleanup_blocks_next_train():
     config = recipe(["trainer.total_training_steps=40"])
     driver = Driver(broken_step=20)

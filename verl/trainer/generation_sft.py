@@ -22,6 +22,7 @@ No real evaluation driver is bundled until those obligations are qualified.
 """
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -207,6 +208,57 @@ class NativePhases:
             raise ValueError("Native checkpoint tracker differs from the completed phase")
 
 
+def recovered_state(reference, task_ids, schedule):
+    """Load explicitly reviewed history; never reroll completed evaluations.
+
+    Every earlier boundary must have a hashed result or an explicit hashed
+    infrastructure invalidation. The pending native checkpoint is verified by
+    the driver before inference. Invalidated scores do not affect patience.
+    """
+    def read(ref):
+        path = Path(ref["path"])
+        raw = path.read_bytes()
+        if path.is_symlink() or hashlib.sha256(raw).hexdigest() != ref["sha256"]:
+            raise ValueError("Recovery evidence changed")
+        return json.loads(raw)
+
+    value = read(reference)
+    step = value["pending_step"]
+    if value.get("schema") != 1 or step not in schedule or step == 0:
+        raise ValueError("Invalid recovery boundary")
+    observations, covered = [], set()
+    for ref in value["completed"]:
+        result = read(ref)
+        s, solved = result.get("step"), result.get("solved_task_ids")
+        if (s in covered or s not in schedule or s >= step
+                or result.get("state") != "completed" or result.get("cleanup_complete") is not True
+                or result.get("task_ids") != task_ids or not isinstance(solved, list)
+                or len(set(solved)) != len(solved) or not set(solved) <= set(task_ids)):
+            raise ValueError("Invalid recovered evaluation")
+        covered.add(s)
+        row = {"step": s, "checkpoint": ref.get("checkpoint"), "solved": len(solved),
+               "total": len(task_ids), "recovered_result_sha256": ref["sha256"]}
+        for key in ("generation_seconds", "elapsed_seconds", "empty_patches"):
+            if key in result:
+                row[key] = result[key]
+        observations.append(row)
+    for ref in value.get("invalidated", []):
+        invalid = read(ref)
+        s = invalid.get("step")
+        if (s in covered or s not in schedule or s >= step or s == 0
+                or invalid.get("state") != "invalid_infrastructure" or not invalid.get("reason")):
+            raise ValueError("Invalid infrastructure exclusion")
+        covered.add(s)
+    if covered != {s for s in schedule if s < step} or not observations or observations[0]["step"] != 0:
+        raise ValueError("Recovery history omits earlier boundaries")
+    if [r["step"] for r in observations] != sorted(r["step"] for r in observations):
+        raise ValueError("Recovery history is unordered")
+    checkpoint = value["checkpoint"]
+    if Path(checkpoint).name != f"global_step_{step}":
+        raise ValueError("Recovery checkpoint boundary differs")
+    return step, checkpoint, observations
+
+
 def run(config, driver, *, clock=time.monotonic, record=lambda value: None):
     schedule = plan(config)
     deadline = clock() + config.workflow.max_wall_seconds
@@ -235,10 +287,27 @@ def run(config, driver, *, clock=time.monotonic, record=lambda value: None):
     best_step, best_solved, bad = 0, -1, 0
     checkpoint = None
     observations = []
+    pending_step = None
+    recovery = config.workflow.get("recovery")
+    if recovery is not None:
+        pending_step, checkpoint, observations = recovered_state(
+            recovery, task_ids, schedule["generation_eval_steps"]
+        )
+        for row in observations:
+            if row["solved"] > best_solved:
+                best_step, best_solved, bad = row["step"], row["solved"], 0
+            elif row["step"]:
+                bad += 1
+        if bad >= config.generation_validation.patience:
+            raise ValueError("Recovered history already exhausted patience")
     for step in schedule["generation_eval_steps"]:
+        if pending_step is not None and step < pending_step:
+            continue
         remaining()
         driver.assert_gpus_idle(config=config, deadline=deadline)
-        if step:
+        if step == pending_step:
+            driver.verify_checkpoint(path=checkpoint, step=step, config=config, deadline=deadline)
+        elif step:
             phase = native_phase_config(config, checkpoint, step)
             checkpoint = driver.train(
                 resume_checkpoint=checkpoint, stop_after_step=step, config=phase, deadline=deadline
@@ -322,6 +391,8 @@ def main(config):
             with SummaryWriter(os.environ.get("TENSORBOARD_DIR", str(output.parent / "tensorboard"))) as writer:
                 writer.add_scalar("validation/solved", row["solved"], row["step"])
                 writer.add_scalar("validation/solved_rate", row["solved"] / row["total"], row["step"])
+                writer.add_scalar("validation/valid", 1, row["step"])
+                writer.add_scalar("selection/solved", row["solved"], row["step"])
                 for key in ("generation_seconds", "elapsed_seconds", "empty_patches", "mean_responses_per_task"):
                     if key in row:
                         writer.add_scalar("validation/" + key, row[key], row["step"])

@@ -54,6 +54,21 @@ def require_settings(config):
         raise ValueError("Remote episode budgets differ")
 
 
+def verify_transport(log_path):
+    """Transport failures invalidate selection, rather than score as model failures."""
+    failures = []
+    with Path(log_path).open() as stream:
+        for line in stream:
+            row = json.loads(line)
+            if row.get("client_cancelled") or row.get("error_type") or row.get("status") != 200:
+                failures.append({k: row.get(k) for k in
+                                 ("task_id", "status", "error_type", "classification", "start", "end")})
+    if failures:
+        write(Path(log_path).with_name("invalid-transport.json"),
+              {"state": "invalid_infrastructure", "failures": failures})
+        raise RuntimeError(f"{len(failures)} incomplete/failed model responses invalidate selection; predictions preserved")
+
+
 def verify_recovered_baseline(reference, evaluator):
     """Reconcile an explicitly pinned, fully graded saved baseline without rerolls."""
     path = Path(reference["path"])
@@ -170,6 +185,17 @@ class RemoteSWEDevEvaluator(SWEDevEvaluator):
             raise ValueError("Selection cohort changed")
         stage = self.output / f"step-{step:06d}"
         stage.mkdir(exist_ok=False)
+        parser_pin = config.generation_inference.get("tool_parser_sha256")
+        if parser_pin is not None:
+            raw = subprocess.check_output([str(self.python), "-c",
+                "import sysconfig,pathlib,hashlib,json; "
+                "p=pathlib.Path(sysconfig.get_paths()['purelib'])/'vllm/tool_parsers/gemma4_tool_parser.py'; "
+                "print(json.dumps({'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}))"],
+                timeout=15)
+            pin = json.loads(raw)
+            if pin["sha256"] != parser_pin:
+                raise ValueError("vLLM Gemma parser lacks the pinned upstream41991 repair")
+            write(stage / "tool-parser-pin.json", pin)
         if step == 0 and self.recovered_step_zero is not None:
             result = self.call_worker(self.request(config, "recover_step_zero", step, deadline), stage / "cpu", deadline)
             self.assert_gpus_idle(config, deadline)
@@ -268,6 +294,21 @@ def worker(request):
         control.mkdir()
         for file in ("diagnostic_solver.py", "diagnostic_agent_prepare.py", "recording_proxy.py", "context-override.json", "rank-map.json"):
             shutil.copy2(profile / file, control / file)
+        transport_timeout = config.generation_validation.get("request_timeout_seconds")
+        if transport_timeout is not None:
+            if type(transport_timeout) is not int or transport_timeout != 600:
+                raise ValueError("Only the reviewed 600s transport guard is admitted")
+            proxy = control / "recording_proxy.py"
+            source = proxy.read_text()
+            old = "ClientTimeout(total=3750)"
+            if source.count(old) != 1:
+                raise ValueError("Unexpected pinned proxy timeout source")
+            original_sha = sha(proxy)
+            proxy.write_text(source.replace(old, "ClientTimeout(total=600)"))
+            write(control / "transport-guard.json", {"original_sha256": original_sha,
+                  "new_sha256": sha(proxy), "request_timeout_seconds": 600,
+                  "episode_timeout_seconds_unchanged": 3600,
+                  "timeout_is_infrastructure_failure_not_model_score": True})
         previous.CONTROL, previous.OUTPUT = control, phase / "episodes-and-grading"
         previous.OUTPUT.mkdir()
         tunnel_args = SSH + ["-o", "ExitOnForwardFailure=yes", "-N", "-L", "127.0.0.1:8400:127.0.0.1:8400", request["gpu_host"]]
@@ -294,6 +335,8 @@ def worker(request):
                 raise ValueError("Copied adapter hash differs")
             previous.run_arm(evaluator, name, None if adapter is None else Path(adapter["path"]),
                              None if adapter is None else adapter["sha256"], config, deadline, endpoint)
+            if transport_timeout is not None:
+                verify_transport(previous.OUTPUT / name / "model-requests-responses.jsonl")
             raw_path = previous.OUTPUT / name / "results.json"
             raw = json.loads(raw_path.read_text())
             result = {"state": raw["state"], "step": step, "task_ids": raw["task_ids"],
