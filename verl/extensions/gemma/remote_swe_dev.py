@@ -7,6 +7,7 @@ The already exercised relaxed-budget solver/proxy/grader sources stay frozen.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -67,6 +68,64 @@ def verify_transport(log_path):
         write(Path(log_path).with_name("invalid-transport.json"),
               {"state": "invalid_infrastructure", "failures": failures})
         raise RuntimeError(f"{len(failures)} incomplete/failed model responses invalidate selection; predictions preserved")
+
+
+def preserved_transport_failure(raw_path, task_ids, step):
+    """Allow bounded continuation only after a fully graded, clean transport failure.
+
+    The invalid arm is retained verbatim and never becomes a selection score.
+    Model errors, missing grades, changed evidence and cleanup failures do not
+    qualify for this recovery path.
+    """
+    raw_path = Path(raw_path)
+    raw = json.loads(raw_path.read_text())
+    errors = raw.get("errors", {})
+    outcomes = raw.get("outcomes", {})
+    if (step == 0 or raw.get("state") != "incomplete"
+            or raw.get("task_ids") != list(task_ids)
+            or set(outcomes) != set(task_ids)
+            or raw.get("cleanup_complete") is not True or raw.get("new_containers") != []
+            or set(errors) != {"transport"}
+            or not isinstance(errors["transport"].get("unexpected_failures"), int)
+            or errors["transport"]["unexpected_failures"] < 1
+            or any(e.get("error") == "ordinary_request_missing_or_wrong_rank_binding"
+                   for e in errors["transport"].get("examples", []))):
+        raise ValueError("Failure is not a clean, fully graded transport-only arm")
+    failed = 0
+    for line in (raw_path.parent / "model-requests-responses.jsonl").open():
+        row = json.loads(line)
+        if "chat/completions" not in row.get("path", ""):
+            continue
+        if row.get("client_cancelled"):
+            raise ValueError("Unfinished cancelled request blocks continuation")
+        if "error" in row or row.get("status", 0) >= 500:
+            failed += 1
+        elif row.get("status") != 200:
+            raise ValueError("Unexpected transport response blocks continuation")
+    if failed != errors["transport"]["unexpected_failures"]:
+        raise ValueError("Transport failures differ from recorded result")
+    for task, outcome in outcomes.items():
+        slug = task + "-" + hashlib.sha256(task.encode()).hexdigest()[:12]
+        prediction = raw_path.parent / "episodes" / slug / "generation/predictions.jsonl"
+        if (type(outcome.get("resolved")) is not bool
+                or prediction.is_symlink() or sha(prediction) != outcome.get("prediction_sha256")):
+            raise ValueError("Saved prediction differs; no regeneration permitted")
+        payload = json.loads(prediction.read_text())
+        if payload.get("instance_id") != task:
+            raise ValueError("Saved prediction has a different task identity")
+        if outcome.get("reason") == "empty_patch":
+            if outcome["resolved"] or payload.get("model_patch", "").strip():
+                raise ValueError("Invalid empty-patch outcome")
+        else:
+            report = Path(outcome["report"])
+            if report.is_symlink() or sha(report) != outcome.get("report_sha256"):
+                raise ValueError("Saved grade differs")
+    return {"state": "invalid_infrastructure", "reason_code": "model_transport_failure",
+            "step": step, "task_ids": list(task_ids), "graded_count": len(outcomes),
+            "cleanup_complete": True, "cpu_result_path": str(raw_path),
+            "cpu_result_sha256": sha(raw_path), "transport_failures": failed,
+            "raw_solved_not_selection": sum(v["resolved"] for v in outcomes.values()),
+            "predictions_preserved": True, "generation_rerun": False}
 
 
 def verify_recovered_baseline(reference, evaluator):
@@ -257,7 +316,10 @@ class RemoteSWEDevEvaluator(SWEDevEvaluator):
             self._stop(server)
             self.assert_gpus_idle(config, deadline)
             write(stage / "gpu-cleanup.json", {"gpu_contexts_released": True, "server_returncode": server.returncode})
-        if result.get("state") != "completed" or result.get("cleanup_complete") is not True:
+        accepted_states = {"completed"}
+        if config.workflow.get("max_invalid_evaluations", 0):
+            accepted_states.add("invalid_infrastructure")
+        if result.get("state") not in accepted_states or result.get("cleanup_complete") is not True:
             raise RuntimeError("Remote generation/grading/cleanup incomplete")
         write(stage / "results.json", result)
         return result
@@ -333,13 +395,22 @@ def worker(request):
             name = "baseline" if adapter is None else f"sft_step_{step}"
             if adapter and sha(Path(adapter["path"]) / "adapter_model.safetensors") != adapter["sha256"]:
                 raise ValueError("Copied adapter hash differs")
-            previous.run_arm(evaluator, name, None if adapter is None else Path(adapter["path"]),
-                             None if adapter is None else adapter["sha256"], config, deadline, endpoint)
-            if transport_timeout is not None:
-                verify_transport(previous.OUTPUT / name / "model-requests-responses.jsonl")
             raw_path = previous.OUTPUT / name / "results.json"
+            failed_transport = False
+            try:
+                previous.run_arm(evaluator, name, None if adapter is None else Path(adapter["path"]),
+                                 None if adapter is None else adapter["sha256"], config, deadline, endpoint)
+            except AssertionError as error:
+                if (str(error) != "Incomplete arm; do not advance or relabel failures"
+                        or not config.workflow.get("max_invalid_evaluations", 0)):
+                    raise
+                result = preserved_transport_failure(raw_path, evaluator.ids, step)
+                failed_transport = True
+            if not failed_transport and transport_timeout is not None:
+                verify_transport(previous.OUTPUT / name / "model-requests-responses.jsonl")
             raw = json.loads(raw_path.read_text())
-            result = {"state": raw["state"], "step": step, "task_ids": raw["task_ids"],
+            if not failed_transport:
+                result = {"state": raw["state"], "step": step, "task_ids": raw["task_ids"],
                       "solved_task_ids": [t for t, value in raw["outcomes"].items() if value["resolved"]],
                       "cleanup_complete": raw["cleanup_complete"], "cpu_result_path": str(raw_path),
                       "cpu_result_sha256": sha(raw_path), "generation_seconds": raw["generation_seconds"],

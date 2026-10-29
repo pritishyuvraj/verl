@@ -185,6 +185,94 @@ def test_failed_eval_cleanup_blocks_next_train():
     assert not any(event[:2] == ("train", 40) for event in driver.events)
 
 
+def test_resume_training_after_invalid_saved_boundary(tmp_path):
+    import hashlib
+    import json
+    from omegaconf import open_dict
+
+    reference = recovery_fixture(tmp_path)
+    p = Path(reference["path"])
+    receipt = json.loads(p.read_text())
+    receipt.update(schema=2, resume_after_step=20, checkpoint="/native/global_step_20")
+    p.write_text(json.dumps(receipt))
+    reference["sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
+    config = recipe(["trainer.total_training_steps=40"])
+    with open_dict(config.workflow):
+        config.workflow.recovery = reference
+        config.workflow.max_invalid_evaluations = 4
+    driver = Driver(scores=(2,))
+    result = workflow.run(config, driver)
+    assert ("checkpoint", 20) in driver.events
+    assert ("train", 40, "/native/global_step_20") in driver.events
+    assert [e[1] for e in driver.events if e[0] == "eval"] == [40]
+    assert result["selected_step"] == 40
+    assert len(result["invalidated"]) == 1
+
+
+@pytest.mark.parametrize("limit,clean", [(0, True), (1, True), (2, True), (2, False)])
+def test_bounded_transport_continuation_never_selects_or_rerolls(limit, clean):
+    from omegaconf import open_dict
+
+    config = recipe(["trainer.total_training_steps=40"])
+    with open_dict(config.workflow):
+        config.workflow.max_invalid_evaluations = limit
+    class Interrupted(Driver):
+        def evaluate(self, **args):
+            if args["step"] == 20:
+                self.events.append(("eval", 20))
+                return {"state": "invalid_infrastructure", "step": 20,
+                        "task_ids": list(args["task_ids"]), "cleanup_complete": clean,
+                        "graded_count": 2, "reason_code": "model_transport_failure",
+                        "cpu_result_sha256": "a" * 64, "raw_solved_not_selection": 999}
+            return super().evaluate(**args)
+    driver, records = Interrupted(scores=(1, 2)), []
+    if limit == 2 and clean:
+        result = workflow.run(config, driver, record=records.append)
+        assert [r["step"] for r in result["observations"]] == [0, 40]
+        assert result["selected_solved"] == 2
+        assert records[1]["invalid_step"] == 20
+        assert ("train", 40, "/native/global_step_20") in driver.events
+    else:
+        with pytest.raises((ValueError, RuntimeError)):
+            workflow.run(config, driver, record=records.append)
+        assert not any(e[:2] == ("train", 40) for e in driver.events)
+    assert sum(e[:2] == ("eval", 20) for e in driver.events) == 1
+
+
+@pytest.mark.parametrize("damage", [None, "cleanup", "missing", "prediction", "rank", "cancelled"])
+def test_preserved_transport_failure_requires_actual_complete_evidence(tmp_path, damage):
+    import hashlib
+    import json
+    from verl.extensions.gemma.remote_swe_dev import preserved_transport_failure
+
+    task = "task-a"
+    slug = task + "-" + hashlib.sha256(task.encode()).hexdigest()[:12]
+    prediction = tmp_path / "episodes" / slug / "generation/predictions.jsonl"
+    prediction.parent.mkdir(parents=True)
+    prediction.write_text(json.dumps({"instance_id": task, "model_patch": ""}))
+    raw = {"state": "incomplete", "task_ids": [task], "cleanup_complete": True,
+           "new_containers": [], "errors": {"transport": {"unexpected_failures": 1}},
+           "outcomes": {task: {"resolved": False, "reason": "empty_patch",
+                        "prediction_sha256": hashlib.sha256(prediction.read_bytes()).hexdigest()}}}
+    response = {"path": "/v1/chat/completions", "error": "", "error_type": "TimeoutError"}
+    if damage == "cleanup": raw["new_containers"] = ["unknown"]
+    if damage == "missing": raw["outcomes"] = {}
+    if damage == "prediction": prediction.write_text("changed")
+    if damage == "rank":
+        raw["errors"]["transport"]["examples"] = [{"error": "ordinary_request_missing_or_wrong_rank_binding"}]
+    if damage == "cancelled": response["client_cancelled"] = True
+    (tmp_path / "model-requests-responses.jsonl").write_text(json.dumps(response) + "\n")
+    path = tmp_path / "results.json"
+    path.write_text(json.dumps(raw))
+    if damage:
+        with pytest.raises(ValueError):
+            preserved_transport_failure(path, [task], 20)
+    else:
+        result = preserved_transport_failure(path, [task], 20)
+        assert result["graded_count"] == 1 and result["generation_rerun"] is False
+        assert "solved_task_ids" not in result
+
+
 def test_final_evaluation_overlap_blocks_before_any_gpu_phase():
     driver = Driver()
     driver.qualify = lambda **kwargs: {"task_ids": ["dev-task"], "final_evaluation_overlap": True}

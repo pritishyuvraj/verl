@@ -193,3 +193,4 @@ trainer:
 workflow:
   execute: false # CLI workflow.execute=true starts; otherwise print the plan.
   max_wall_seconds: 86400
+  max_invalid_evaluations: 0 # Opt-in only: clean transport failures remain excluded; cap includes recovered exclusions.

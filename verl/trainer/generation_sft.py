@@ -71,6 +71,12 @@ def plan(config):
         raise ValueError("Retain checkpoints until generation-based best selection completes")
     if not 0 < config.workflow.max_wall_seconds <= 86400:
         raise ValueError("A workflow requires a finite wall budget of at most one day")
+    invalid_limit = config.workflow.get("max_invalid_evaluations", 0)
+    if type(invalid_limit) is not int or not 0 <= invalid_limit <= 4:
+        raise ValueError("Infrastructure continuation requires a bounded limit between zero and four")
+    headroom = config.workflow.get("minimum_phase_seconds", 0)
+    if type(headroom) is not int or not 0 <= headroom <= 86400:
+        raise ValueError("Invalid minimum phase budget")
     steps = list(range(frequency, total + 1, frequency))
     if not steps or steps[-1] != total:
         steps.append(total)
@@ -224,7 +230,7 @@ def recovered_state(reference, task_ids, schedule):
 
     value = read(reference)
     step = value["pending_step"]
-    if value.get("schema") != 1 or step not in schedule or step == 0:
+    if value.get("schema") not in (1, 2) or step not in schedule or step == 0:
         raise ValueError("Invalid recovery boundary")
     observations, covered = [], set()
     for ref in value["completed"]:
@@ -254,7 +260,12 @@ def recovered_state(reference, task_ids, schedule):
     if [r["step"] for r in observations] != sorted(r["step"] for r in observations):
         raise ValueError("Recovery history is unordered")
     checkpoint = value["checkpoint"]
-    if Path(checkpoint).name != f"global_step_{step}":
+    checkpoint_step = step
+    if value["schema"] == 2:
+        checkpoint_step = value.get("resume_after_step")
+        if checkpoint_step != schedule[schedule.index(step) - 1] or checkpoint_step == 0:
+            raise ValueError("Training recovery must resume the immediately preceding native boundary")
+    if Path(checkpoint).name != f"global_step_{checkpoint_step}":
         raise ValueError("Recovery checkpoint boundary differs")
     return step, checkpoint, observations
 
@@ -288,11 +299,17 @@ def run(config, driver, *, clock=time.monotonic, record=lambda value: None):
     checkpoint = None
     observations = []
     pending_step = None
+    invalidated = []
+    recovery_checkpoint_step = None
     recovery = config.workflow.get("recovery")
     if recovery is not None:
         pending_step, checkpoint, observations = recovered_state(
             recovery, task_ids, schedule["generation_eval_steps"]
         )
+        receipt = json.loads(Path(recovery["path"]).read_text())
+        invalidated = list(receipt.get("invalidated", []))
+        recovery_checkpoint_step = int(Path(checkpoint).name.removeprefix("global_step_"))
+        driver.verify_checkpoint(path=checkpoint, step=recovery_checkpoint_step, config=config, deadline=deadline)
         for row in observations:
             if row["solved"] > best_solved:
                 best_step, best_solved, bad = row["step"], row["solved"], 0
@@ -300,12 +317,19 @@ def run(config, driver, *, clock=time.monotonic, record=lambda value: None):
                 bad += 1
         if bad >= config.generation_validation.patience:
             raise ValueError("Recovered history already exhausted patience")
+    invalid_limit = config.workflow.get("max_invalid_evaluations", 0)
+    if invalid_limit and len(invalidated) >= invalid_limit:
+        raise RuntimeError("Infrastructure continuation limit already exhausted")
+    stop_reason = "schedule_completed"
     for step in schedule["generation_eval_steps"]:
         if pending_step is not None and step < pending_step:
             continue
         remaining()
+        if deadline - clock() < config.workflow.get("minimum_phase_seconds", 0):
+            stop_reason = "insufficient_remaining_wall_budget"
+            break
         driver.assert_gpus_idle(config=config, deadline=deadline)
-        if step == pending_step:
+        if step == pending_step and recovery_checkpoint_step == step:
             driver.verify_checkpoint(path=checkpoint, step=step, config=config, deadline=deadline)
         elif step:
             phase = native_phase_config(config, checkpoint, step)
@@ -325,6 +349,22 @@ def run(config, driver, *, clock=time.monotonic, record=lambda value: None):
         if clock() >= evaluation_deadline:
             raise TimeoutError("Generation evaluation exceeded its wall budget; no training resume")
         solved = outcome.get("solved_task_ids")
+        if outcome.get("state") == "invalid_infrastructure":
+            if (not invalid_limit or step == 0 or outcome.get("step") != step
+                    or outcome.get("task_ids") != task_ids
+                    or outcome.get("cleanup_complete") is not True
+                    or outcome.get("graded_count") != len(task_ids)
+                    or outcome.get("reason_code") != "model_transport_failure"
+                    or not outcome.get("cpu_result_sha256")):
+                raise ValueError("Unqualified infrastructure failure; no training resume")
+            invalidated.append(outcome)
+            record({"observations": observations, "invalidated": invalidated,
+                    "invalid_step": step, "selected_step": best_step, "selected_solved": best_solved})
+            if len(invalidated) >= invalid_limit:
+                raise RuntimeError("Infrastructure continuation limit exhausted; checkpoint preserved")
+            # No rerolls or patience update: restore this native checkpoint at
+            # the next boundary and require a fresh, fully graded evaluation.
+            continue
         if (
             outcome.get("state") != "completed"
             or type(outcome.get("step")) is not int
@@ -352,15 +392,19 @@ def run(config, driver, *, clock=time.monotonic, record=lambda value: None):
             best_step, best_solved, bad = step, len(solved), 0
         elif step:
             bad += 1
-        record({"observations": observations, "selected_step": best_step, "selected_solved": best_solved})
+        record({"observations": observations, "invalidated": invalidated,
+                "selected_step": best_step, "selected_solved": best_solved})
         if bad >= config.generation_validation.patience:
+            stop_reason = "generation_patience"
             break
     remaining()
     return {
         "state": "completed_generation_selection",
+        "stop_reason": stop_reason,
         "selected_step": best_step,
         "selected_solved": best_solved,
         "observations": observations,
+        "invalidated": invalidated,
         "nll_used_for_selection": False,
     }
 
@@ -381,7 +425,8 @@ def main(config):
 
     def record(value):
         # Append exclusive history snapshots; never overwrite prior predictions or scores.
-        path = output / f"generation-history-{len(value['observations']):04d}.yaml"
+        step = value.get("invalid_step", value["observations"][-1]["step"])
+        path = output / f"generation-history-step-{step:06d}.yaml"
         with path.open("x") as stream:
             OmegaConf.save(OmegaConf.create(value), stream)
         if "tensorboard" in config.trainer.logger:
@@ -389,6 +434,10 @@ def main(config):
 
             row = value["observations"][-1]
             with SummaryWriter(os.environ.get("TENSORBOARD_DIR", str(output.parent / "tensorboard"))) as writer:
+                if "invalid_step" in value:
+                    writer.add_scalar("validation/valid", 0, value["invalid_step"])
+                    writer.add_scalar("validation/infrastructure_failures", len(value["invalidated"]), value["invalid_step"])
+                    return
                 writer.add_scalar("validation/solved", row["solved"], row["step"])
                 writer.add_scalar("validation/solved_rate", row["solved"] / row["total"], row["step"])
                 writer.add_scalar("validation/valid", 1, row["step"])
