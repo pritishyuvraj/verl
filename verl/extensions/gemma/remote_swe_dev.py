@@ -15,15 +15,31 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
 from omegaconf import OmegaConf
 
-from verl.extensions.gemma.swe_dev import MODEL, SWEDevEvaluator, sha, write
+from verl.extensions.gemma.swe_dev import MODEL, SWEDevEvaluator, read_report, sha, write
 
 PROFILE = "outputs/runtime/gemma-relaxed-128k-60m-20261027-attempt004-baseline-continuation"
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=yes", "-o", "ServerAliveInterval=20", "-o", "ServerAliveCountMax=3"]
+
+
+def atomic_status(path, value):
+    """Concurrent progress writers must never share a temporary filename."""
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def require_settings(config):
@@ -38,21 +54,84 @@ def require_settings(config):
         raise ValueError("Remote episode budgets differ")
 
 
+def verify_recovered_baseline(reference, evaluator):
+    """Reconcile an explicitly pinned, fully graded saved baseline without rerolls."""
+    path = Path(reference["path"])
+    if sha(path) != reference["sha256"]:
+        raise ValueError("Recovered baseline receipt changed")
+    value = json.loads(path.read_text())
+    if (value.get("state") != "completed" or value.get("step") != 0
+            or value.get("cleanup_complete") is not True or value.get("generation_rerun") is not False
+            or value.get("task_ids") != evaluator.ids or set(value.get("artifact_rows", {})) != set(evaluator.ids)):
+        raise ValueError("Recovered baseline is incomplete or a different cohort")
+    protocol = Path(value["original_protocol"])
+    if sha(protocol) != value["protocol_sha256"]:
+        raise ValueError("Recovered baseline protocol changed")
+    binding = json.loads(protocol.read_text())
+    if binding["fixture_v4"] != evaluator.fixture or binding["qualified_ids"] != evaluator.ids:
+        raise ValueError("Recovered baseline environment differs")
+    for filename, expected in {**binding["source_pins"], **value["input_pins"]}.items():
+        if sha(filename) != expected:
+            raise ValueError(f"Recovered baseline evidence changed: {filename}")
+    solved = []
+    for task in evaluator.ids:
+        row = value["artifact_rows"][task]
+        if sha(row["prediction"]) != row["prediction_sha256"] or sha(row["outcome"]) != row["outcome_sha256"]:
+            raise ValueError("Recovered prediction or grade changed")
+        prediction = json.loads(Path(row["prediction"]).read_text())
+        outcome = json.loads(Path(row["outcome"]).read_text())
+        if prediction["instance_id"] != task or outcome["prediction_sha256"] != row["prediction_sha256"]:
+            raise ValueError("Recovered grade identity differs")
+        if outcome.get("report"):
+            if sha(outcome["report"]) != outcome["report_sha256"]:
+                raise ValueError("Recovered official report changed")
+            resolved = read_report(outcome["report"], task)
+        elif not prediction["model_patch"].strip() and outcome.get("reason") == "empty_patch":
+            resolved = False
+        elif outcome.get("reason") == "official_patch_apply_failed_malformed_model_patch":
+            evidence = outcome["evidence"]
+            if len(evidence) != 3 or any(sha(e["path"]) != e["sha256"] for e in evidence):
+                raise ValueError("Invalid-patch evidence changed")
+            manifest, aggregate = [json.loads(Path(e["path"]).read_text()) for e in evidence[:2]]
+            log = Path(evidence[2]["path"]).read_text()
+            if not (manifest["instance_ids"] == [task] and manifest["predictions_sha256"] == row["prediction_sha256"]
+                    and aggregate["submitted_ids"] == [task] and aggregate["error_ids"] == [task]
+                    and aggregate["completed_instances"] == aggregate["resolved_instances"] == 0
+                    and "Patch Apply Failed" in log and "patch: **** malformed patch" in log):
+                raise ValueError("Unproven invalid-patch failure")
+            resolved = False
+        else:
+            raise ValueError("Missing independent grading evidence")
+        if type(outcome.get("resolved")) is not bool or outcome["resolved"] != resolved:
+            raise ValueError("Recovered outcome disagrees with executable tests")
+        if resolved:
+            solved.append(task)
+    if value["solved_task_ids"] != solved or evaluator.containers() != evaluator.initial_containers:
+        raise ValueError("Recovered aggregate or current cleanup differs")
+    return {**value, "recovery_receipt_sha256": reference["sha256"]}
+
+
 class RemoteSWEDevEvaluator(SWEDevEvaluator):
     def __init__(self, project_root, baseline_report, protocol, output_dir, cpu_host, gpu_host,
                  cpu_project_root, cpu_source_dir="/home/ubuntu/workspace/verl-gemma-hor3-20261028",
-                 cpu_output_dir="outputs/eval/e4b-packed-lora-lr1e5-hor3-20261028"):
+                 cpu_output_dir="outputs/eval/e4b-packed-lora-lr1e5-hor3-20261028",
+                 recovered_step_zero=None):
         super().__init__(project_root, baseline_report, protocol, output_dir)
         self.cpu_host, self.gpu_host = cpu_host, gpu_host
         self.cpu_root, self.cpu_source = Path(cpu_project_root), Path(cpu_source_dir)
         self.cpu_output = self.cpu_root / cpu_output_dir
         self.baseline_report, self.protocol = baseline_report, protocol
+        self.recovered_step_zero = (
+            OmegaConf.to_container(recovered_step_zero, resolve=True)
+            if OmegaConf.is_config(recovered_step_zero) else recovered_step_zero
+        )
 
     def request(self, config, action, step, deadline, adapter=None):
         return {"action": action, "step": step, "cpu_root": str(self.cpu_root),
                 "cpu_output": str(self.cpu_output), "gpu_host": self.gpu_host,
                 "baseline_report": self.baseline_report, "protocol": self.protocol,
                 "adapter": adapter, "deadline_unix": time.time() + deadline - time.monotonic(),
+                "recovered_step_zero": self.recovered_step_zero,
                 "config": OmegaConf.to_container(config, resolve=True)}
 
     def call_worker(self, request, local_dir, deadline):
@@ -91,6 +170,11 @@ class RemoteSWEDevEvaluator(SWEDevEvaluator):
             raise ValueError("Selection cohort changed")
         stage = self.output / f"step-{step:06d}"
         stage.mkdir(exist_ok=False)
+        if step == 0 and self.recovered_step_zero is not None:
+            result = self.call_worker(self.request(config, "recover_step_zero", step, deadline), stage / "cpu", deadline)
+            self.assert_gpus_idle(config, deadline)
+            write(stage / "results.json", result)
+            return result
         if step == 0:
             from verl.trainer.generation_sft import NativePhases, native_phase_config
 
@@ -165,11 +249,18 @@ def worker(request):
     spec = importlib.util.spec_from_file_location("verified_relaxed_profile", profile / "run_relaxed.py")
     previous = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(previous)
+    # Preserve historical source bytes. Its watcher, main collector and eight
+    # graders otherwise race on the same status.tmp pathname.
+    previous.atomic = atomic_status
     output.mkdir(parents=True, exist_ok=True)
     step = request["step"]
     phase = output / ("host-qualification" if request["action"] == "qualify" else f"step-{step:06d}")
     evaluator = previous.Evaluator(root, request["baseline_report"], request["protocol"], phase / "qualification")
     result = evaluator.qualify(config, deadline)
+    if request["action"] == "recover_step_zero":
+        if step != 0:
+            raise ValueError("Only the pretraining baseline can be recovered without a native checkpoint")
+        result = verify_recovered_baseline(request["recovered_step_zero"], evaluator)
     if request["action"] == "evaluate":
         # All pinned tool/client/compaction/rank-map source bytes remain unchanged.
         # Only the per-phase output location and the served adapter change.

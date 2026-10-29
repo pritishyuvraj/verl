@@ -209,3 +209,87 @@ def test_native_training_command_uses_eight_workers_and_preserves_resume(tmp_pat
     assert saved.trainer.resume_mode == "resume_path"
     assert saved.trainer.resume_from_path == "/native/global_step_20"
     assert result == str(tmp_path / "global_step_40")
+
+
+def test_remote_status_concurrent_writers_have_private_temporary_files(tmp_path, monkeypatch):
+    import concurrent.futures
+    import json
+    import threading
+    from verl.extensions.gemma import remote_swe_dev
+
+    barrier = threading.Barrier(16)
+    original = remote_swe_dev.os.replace
+    sources = []
+
+    def concurrent_replace(source, destination):
+        sources.append(source)
+        barrier.wait(timeout=10)
+        original(source, destination)
+
+    monkeypatch.setattr(remote_swe_dev.os, "replace", concurrent_replace)
+    path = tmp_path / "status.json"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(lambda i: remote_swe_dev.atomic_status(path, {"generated": i}), range(16)))
+    assert len(set(sources)) == 16
+    assert json.loads(path.read_text())["generated"] in range(16)
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_remote_status_failed_replace_preserves_previous_status(tmp_path, monkeypatch):
+    from verl.extensions.gemma import remote_swe_dev
+
+    path = tmp_path / "status.json"
+    path.write_text('{"generated": 87}\n')
+
+    def fail(*args):
+        raise OSError("simulated storage failure")
+
+    monkeypatch.setattr(remote_swe_dev.os, "replace", fail)
+    with pytest.raises(OSError, match="storage failure"):
+        remote_swe_dev.atomic_status(path, {"generated": 88})
+    assert path.read_text() == '{"generated": 87}\n'
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("corruption", [None, "prediction", "grade", "aggregate", "cleanup", "incomplete"])
+def test_recovered_baseline_requires_actual_immutable_grades(tmp_path, corruption):
+    import json
+    from types import SimpleNamespace
+    from verl.extensions.gemma.remote_swe_dev import verify_recovered_baseline
+    from verl.extensions.gemma.swe_dev import sha
+
+    def save(name, value):
+        path = tmp_path / name
+        path.write_text(json.dumps(value))
+        return str(path)
+
+    prediction = save("pred.json", {"instance_id": "task", "model_patch": "diff"})
+    official = {"task": {"resolved": True, "patch_successfully_applied": True,
+                        "tests_status": {"FAIL_TO_PASS": {"failure": []}, "PASS_TO_PASS": {"failure": []}}}}
+    save("official.json", official)
+    report = save("worker.json", {"official_reports": [{"path": "official.json", "report": official}]})
+    outcome = save("outcome.json", {"resolved": True, "prediction_sha256": sha(prediction),
+                                   "report": report, "report_sha256": sha(report)})
+    protocol = save("protocol.json", {"fixture_v4": {"binding": "same"}, "qualified_ids": ["task"], "source_pins": {}})
+    value = {"state": "completed", "step": 0, "cleanup_complete": True, "generation_rerun": False,
+             "task_ids": ["task"], "solved_task_ids": ["task"], "original_protocol": protocol,
+             "protocol_sha256": sha(protocol), "input_pins": {}, "artifact_rows": {
+                 "task": {"prediction": prediction, "prediction_sha256": sha(prediction),
+                          "outcome": outcome, "outcome_sha256": sha(outcome)}}}
+    if corruption == "aggregate":
+        value["solved_task_ids"] = []
+    if corruption == "incomplete":
+        value["state"] = "incomplete"
+    receipt = save("recovery.json", value)
+    reference = {"path": receipt, "sha256": sha(receipt)}
+    if corruption == "prediction":
+        Path(prediction).write_text("changed")
+    if corruption == "grade":
+        save("official.json", {"task": {"resolved": False}})
+    evaluator = SimpleNamespace(ids=["task"], fixture={"binding": "same"}, initial_containers=set(),
+                                containers=lambda: {"unexpected"} if corruption == "cleanup" else set())
+    if corruption:
+        with pytest.raises(ValueError):
+            verify_recovered_baseline(reference, evaluator)
+    else:
+        assert verify_recovered_baseline(reference, evaluator)["solved_task_ids"] == ["task"]
