@@ -8,6 +8,8 @@ from pathlib import Path
 import time
 import uuid
 
+from verl.extensions.gemma.rl_recovery import output_cap, context_budget_error, grade_run_id, recover_initial
+
 from aiohttp import web
 import ray
 
@@ -60,12 +62,26 @@ class GemmaSWEAgentLoop(AgentLoopBase):
             raise RuntimeError("Task is outside the admitted cohort")
         if not validate and task_id not in admission["tasks"]:
             raise RuntimeError("Heldout task cannot enter training")
-        capacity = EpisodeCapacity.options(name="gemma-swe-capacity", get_if_exists=True).remote(
+        capacity = EpisodeCapacity.options(name="gemma-swe-capacity", get_if_exists=True, lifetime="detached").remote(
             cfg.max_active_episodes, cfg.max_active_graders)
         identifier = uuid.uuid4().hex
         out = root / "episodes" / partition / identifier
         out.mkdir(parents=True, exist_ok=False)
         token_turns, faults, budget_errors = [], [], []
+        recovered = recover_initial(root, task, out, validate=validate, step=kwargs["global_steps"],
+            config_path=Path(__file__).parents[2]/"trainer/config/gemma_grpo_hor1.yaml")
+        if recovered is not None:
+            start = time.monotonic()
+            env = {**os.environ,"DOCKER_HOST":"unix:///dev/shm/pritish-gemma4-20261025/eval-docker/docker.sock",
+                   "HF_HUB_OFFLINE":"1","TRANSFORMERS_OFFLINE":"1"}
+            await capacity.acquire.remote("grade")
+            try:
+                await self._grade_dev(project,root,out,task_id,metadata,env)
+                generation = json.loads((out/"generation.json").read_text())
+                errors = [generation["error"]] if context_budget_error(generation.get("error")) else []
+                return self._finish(out,recovered,errors,start,partition,task_id,kwargs)
+            finally:
+                await capacity.release.remote("grade")
         if GemmaSWEAgentLoop._renderer is None:
             GemmaSWEAgentLoop._renderer = make_renderer(self.config.actor_rollout_ref.model.path,
                                                        self.config.actor_rollout_ref.model.tokenizer_path)
@@ -90,7 +106,7 @@ class GemmaSWEAgentLoop(AgentLoopBase):
                 else:
                     faults.append(error)
                 return web.json_response({"error":str(rendered)},status=400)
-            ordinary = request.max_tokens == cfg.output_tokens
+            ordinary = output_cap(payload) == cfg.output_tokens
             if ordinary and (request.temperature,request.top_p,request.top_k,request.thinking_token_budget) != (1.0,0.95,64,4096):
                 raise RuntimeError("Official policy sampling mismatch")
             if len(rendered.token_ids) + rendered.sampling_params.max_tokens > cfg.context_tokens:
@@ -136,6 +152,9 @@ class GemmaSWEAgentLoop(AgentLoopBase):
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                if context_budget_error(error):
+                    budget_errors.append(repr(error))
+                    return web.json_response({"error":repr(error)},status=400)
                 faults.append(repr(error))
                 return web.json_response({"error":repr(error)},status=500)
 
@@ -162,6 +181,7 @@ class GemmaSWEAgentLoop(AgentLoopBase):
             (out/"episode-request.json").write_text(json.dumps(request))
             await self._subprocess([str(project/".runtime/venvs/scorer-v31/bin/python"),
                 str(Path(__file__).with_name("rl_episode.py")),"--request",str(out/"episode-request.json")],out/"episode.log",env,420)
+            (out/"transport.json").write_text(json.dumps({"faults":faults,"budget_errors":budget_errors}))
             if faults or not token_turns:
                 raise RuntimeError(f"Invalid episode transport: {faults}; generated turns={len(token_turns)}")
             await capacity.acquire.remote("grade")
@@ -176,34 +196,39 @@ class GemmaSWEAgentLoop(AgentLoopBase):
                 grade = json.loads((out/"grade/reward.json").read_text())
             finally:
                 await capacity.release.remote("grade")
-            if type(grade["resolved"]) is not bool:
-                raise RuntimeError("Executable reward missing")
-            generation = json.loads((out/"generation.json").read_text())
-            reward = float(grade["resolved"])
-            outputs = []
-            for turn in token_turns:
-                if not turn["ordinary"]:
-                    # Official auxiliary summaries remain logged, but are not policy actions.
-                    continue
-                extra = dict(turn["extra_fields"])
-                extra["reward_extra_info"] = {"acc":reward,"empty_patch":float(generation["empty_patch"]),
-                    "timeout":float("time" in str(generation.get("error","")).lower()),"turns":len(token_turns)}
-                outputs.append(AgentLoopOutput(prompt_ids=turn["prompt_ids"],response_ids=turn["response_ids"],
-                    response_mask=[1]*len(turn["response_ids"]),response_logprobs=turn["log_probs"],reward_score=reward,
-                    num_turns=len(token_turns),metrics=AgentLoopMetrics(generate_sequences=time.monotonic()-start),extra_fields=extra))
-            if not outputs:
-                raise RuntimeError("No ordinary policy actions were generated")
-            audit_hash = hashlib.sha256(f"{cfg.audit_seed}:{partition}:{task_id}:{kwargs['session_id']}".encode()).digest()
-            (out/"completed.json").write_text(json.dumps({"task":task_id,"uid":kwargs["uid"],"session":kwargs["session_id"],
-                "launch_owner":os.environ["GEMMA_RL_OWNER"],
-                "reward":reward,"turns":len(token_turns),"seconds":time.monotonic()-start,"judge":"offline",
-                "context_errors":budget_errors,"offline_audit_selected":
-                    int.from_bytes(audit_hash[:8],"big") / 2**64 < cfg.audit_fraction_per_outcome,
-                "policy_versions":[t["extra_fields"] for t in token_turns]}))
-            return outputs
+            return self._finish(out, token_turns, budget_errors, start, partition, task_id, kwargs)
         finally:
             await runner.cleanup()
             await capacity.release.remote("episode")
+
+    def _finish(self, out, token_turns, budget_errors, start, partition, task_id, kwargs):
+        cfg = self.config.gemma_swe
+        grade = json.loads((out/"grade/reward.json").read_text())
+        if type(grade["resolved"]) is not bool:
+            raise RuntimeError("Executable reward missing")
+        generation = json.loads((out/"generation.json").read_text())
+        reward = float(grade["resolved"])
+        outputs = []
+        for turn in token_turns:
+            if not turn["ordinary"]:
+                # Official auxiliary summaries remain logged, but are not policy actions.
+                continue
+            extra = dict(turn["extra_fields"])
+            extra["reward_extra_info"] = {"acc":reward,"empty_patch":float(generation["empty_patch"]),
+                "timeout":float("time" in str(generation.get("error","")).lower()),"turns":len(token_turns)}
+            outputs.append(AgentLoopOutput(prompt_ids=turn["prompt_ids"],response_ids=turn["response_ids"],
+                response_mask=[1]*len(turn["response_ids"]),response_logprobs=turn["log_probs"],reward_score=reward,
+                num_turns=len(token_turns),metrics=AgentLoopMetrics(generate_sequences=time.monotonic()-start),extra_fields=extra))
+        if not outputs:
+            raise RuntimeError("No ordinary policy actions were generated")
+        audit_hash = hashlib.sha256(f"{cfg.audit_seed}:{partition}:{task_id}:{kwargs['session_id']}".encode()).digest()
+        (out/"completed.json").write_text(json.dumps({"task":task_id,"uid":kwargs["uid"],"session":kwargs["session_id"],
+            "launch_owner":os.environ["GEMMA_RL_OWNER"],
+            "reward":reward,"turns":len(token_turns),"seconds":time.monotonic()-start,"judge":"offline",
+            "context_errors":budget_errors,"offline_audit_selected":
+                int.from_bytes(audit_hash[:8],"big") / 2**64 < cfg.audit_fraction_per_outcome,
+            "policy_versions":[t["extra_fields"] for t in token_turns]}))
+        return outputs
 
     async def _subprocess(self, command, log, env, seconds):
         with log.open("x") as stream:
@@ -235,7 +260,7 @@ class GemmaSWEAgentLoop(AgentLoopBase):
         else:
             prediction = out/"predictions.jsonl"
             prediction.write_text(json.dumps({"instance_id":task_id,"model_name_or_path":"gemma-rl","model_patch":patch})+"\n")
-            run_id = "grpo-"+out.name
+            run_id = grade_run_id(out, task_id)
             await self._subprocess([str(project/"downloads/.venv-grader/bin/python"),str(project/"scripts/run_swebench_grader_v4.py"),
                 "--binding-json",str(root/"fixture-v4.json"),"--policy-authorization",str(project/"outputs/runtime/context-policy-admission.json"),
                 "--predictions",str(prediction),"--task-id",task_id,"--attempt","1","--instance-image-tag",

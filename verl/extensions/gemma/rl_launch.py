@@ -131,8 +131,9 @@ def main():
 
     started = time.time()
     receipt = {"state": "starting", "command": command, "started": started,
-               "deadline": started + 21600, "owner": token,
+               "deadline": min(started + 21600, float(env.get("GEMMA_RL_DEADLINE", started + 21600))), "owner": token,
                "config_sha256": sha(Path(__file__).parents[2] / "trainer/config/gemma_grpo_hor1.yaml")}
+    assert receipt["deadline"] - started >= 900, "Insufficient original pilot budget"
     write(attempt / "status.json", receipt)
     code = None
     try:
