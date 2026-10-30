@@ -3,6 +3,14 @@ from collections import defaultdict
 import math
 
 
+def require_complete_validation(data_sources, uids, expected):
+    actual = defaultdict(int)
+    for source, uid in zip(data_sources, uids, strict=True):
+        actual[(str(source), str(uid))] += 1
+    if not expected or dict(actual) != expected:
+        raise RuntimeError("Incomplete executable validation: infrastructure failures cannot become score zeros")
+
+
 def group_metrics(keys, scores, *, n, padding=None):
     latest = {}
     for i, (key, reward) in enumerate(zip(keys, scores, strict=True)):

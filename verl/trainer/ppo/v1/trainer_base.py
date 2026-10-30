@@ -1199,6 +1199,9 @@ class PPOTrainer(ABC):
                 dump_path=val_data_dir,
             )
 
+        if self.config.get("gemma_swe"):
+            from verl.extensions.gemma.rl_metrics import require_complete_validation
+            require_complete_validation(data_sources, sample_uids, expected_acc_counts)
         metrics = self._val_metrics_update(
             data_sources,
             sample_uids,

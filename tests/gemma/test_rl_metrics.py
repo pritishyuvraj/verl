@@ -1,8 +1,15 @@
 import unittest
-from verl.extensions.gemma.rl_metrics import group_metrics
+from verl.extensions.gemma.rl_metrics import group_metrics, require_complete_validation
 
 
 class EpisodeMetricTest(unittest.TestCase):
+    def test_missing_or_duplicate_validation_refused(self):
+        expected = {("dev", "a"):1,("dev", "b"):1}
+        require_complete_validation(["dev","dev"],["a","b"],expected)
+        for sources, uids in ((["dev"],["a"]),(["dev","dev"],["a","a"]),([],[])):
+            with self.assertRaises(RuntimeError):
+                require_complete_validation(sources,uids,expected)
+
     def test_variable_turns_do_not_reweight_rewards(self):
         keys, scores = [], []
         for group in range(3):
