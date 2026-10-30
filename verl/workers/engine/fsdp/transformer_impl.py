@@ -1591,14 +1591,22 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
         )
         with autocast_ctx:
+            gemma_rl_positions = None
+            if self.model_config.rl_head_chunk_size:
+                from verl.extensions.gemma.rl_head import prepare_inputs
+                gemma_rl_positions = prepare_inputs(micro_batch, model_inputs, output_args)
             raw_output = self.module(
                 **model_inputs,
                 use_cache=False,
             )  # prevent model thinks we are generating
 
-            model_output = self.prepare_model_outputs(
-                output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
-            )
+            if gemma_rl_positions is not None:
+                from verl.extensions.gemma.rl_head import restore_outputs
+                model_output = restore_outputs(raw_output, micro_batch, gemma_rl_positions)
+            else:
+                model_output = self.prepare_model_outputs(
+                    output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
+                )
 
             if loss_function is not None:
                 loss, metrics = loss_function(

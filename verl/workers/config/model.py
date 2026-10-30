@@ -114,6 +114,8 @@ class HFModelConfig(BaseConfig):
 
     # Optional checkpoint loader; receives auto_class, model_config and dtype.
     weight_loader: Optional[str] = None
+    rl_head_chunk_size: int = 0
+    lora_reference_in_actor: bool = True
 
     override_config: dict = field(default_factory=dict)
 

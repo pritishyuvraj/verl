@@ -353,10 +353,12 @@ class CheckpointEngineWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
         weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
+        from verl.extensions.gemma.rl_sync import receiver_kwargs
         await self.server_adapter.update_weights(
             weights,
             global_steps=global_steps,
             wire_format=getattr(self.checkpoint_engine, "wire_format", "named_tensors"),
+            **receiver_kwargs(self.model_config),
         )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)

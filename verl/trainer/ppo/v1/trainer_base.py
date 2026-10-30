@@ -235,7 +235,9 @@ class PPOTrainer(ABC):
         lora_rank = self.config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
             lora_rank = self.config.actor_rollout_ref.model.get("lora_rank", 0)
-        self.ref_in_actor = lora_rank > 0 or self.config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        self.ref_in_actor = self.config.actor_rollout_ref.model.get("lora_reference_in_actor", True) and (
+            lora_rank > 0 or self.config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        )
 
         # 1. define actor and rollout class
         if Role.Actor in self.role_worker_mapping:
@@ -797,7 +799,9 @@ class PPOTrainer(ABC):
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-        ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        ref_in_actor = config.actor_rollout_ref.model.get("lora_reference_in_actor", True) and (
+            lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        )
 
         if not getattr(self, "_enable_hybrid_replicas", True):
             role = Role.Actor
@@ -1195,13 +1199,19 @@ class PPOTrainer(ABC):
                 dump_path=val_data_dir,
             )
 
-        return self._val_metrics_update(
+        metrics = self._val_metrics_update(
             data_sources,
             sample_uids,
             reward_extra_infos_dict,
             sample_turns,
             expected_acc_counts=expected_acc_counts,
         )
+        if self.config.get("gemma_swe"):
+            metrics.update({"validation/solved": sum(sample_scores), "validation/tasks": len(sample_scores),
+                            "validation/solved_rate": float(np.mean(sample_scores))})
+            for key, tag in (("empty_patch", "empty_patches"), ("timeout", "timeouts")):
+                metrics["validation/" + tag] = sum(reward_extra_infos_dict.get(key, []))
+        return metrics
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1750,6 +1760,11 @@ class PPOTrainer(ABC):
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+        if self.config.get("gemma_swe"):
+            from verl.extensions.gemma.rl_metrics import group_metrics
+            metrics.update(group_metrics(batch.keys, data.batch["rm_scores"].sum(-1).tolist(),
+                n=self.config.actor_rollout_ref.rollout.n,
+                padding=[tag.get("is_padding", False) for tag in batch.tags]))
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -1867,6 +1882,11 @@ class PPOTrainer(ABC):
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         actor_metrics = reduce_metrics(output)
         metrics.update(actor_metrics)
+        if self.config.get("gemma_swe") and "actor/entropy_loss" in actor_metrics:
+            metrics["actor/entropy_nats"] = actor_metrics["actor/entropy_loss"]
+            metrics["actor/entropy_objective"] = (
+                -self.config.actor_rollout_ref.actor.entropy_coeff * actor_metrics["actor/entropy_loss"]
+            )
 
         return batch
 

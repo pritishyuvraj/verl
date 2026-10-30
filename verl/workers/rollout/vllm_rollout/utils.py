@@ -190,7 +190,7 @@ class vLLMColocateWorkerExtension:
 
         # 2. patch the refit of quantized weights, whether the quantization_config comes
         # from the checkpoint (e.g. DeepSeek-V4) or from rollout.quantization via hf_overrides.
-        if is_quantized_model(vllm_config):
+        if is_quantized_model(vllm_config) and not getattr(cls, "frozen_base_adapter_only", False):
             configure_fp8_ignored_layers_match_mode(vllm_config)
             apply_vllm_quant_patches()
 

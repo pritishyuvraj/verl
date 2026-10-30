@@ -16,8 +16,29 @@
 | Controller | [`generation_sft.py`](verl/trainer/generation_sft.py); checkpoint → training exit → GPU release → generation/tests → cleanup → resume |
 | Qualification | Real SWE evaluator/panel still missing; default plan starts no job; execution refuses missing inputs |
 | Native NLL | `trainer.test_freq=-1` disables NLL; `generation_validation.every_steps=20` controls actual generation validation |
-| RL | Upstream [`main_ppo.py`](verl/trainer/main_ppo.py) retained; Gemma rollout/reward integration unqualified |
+| RL pilot | [`gemma_grpo_hor1.yaml`](verl/trainer/config/gemma_grpo_hor1.yaml); native async GRPO; eight rollouts; executable-test rewards; offline judge |
 | Verification | 44 CPU tests on Hor; 29 local checks; two heavy-runtime modules skipped locally; no GPU run |
+
+The bounded RL pilot uses the prepared Hor-1 runtime and admitted datasets:
+
+```bash
+cd /home/ubuntu/workspace/verl-gemma-rl-20261029
+export GEMMA_PROJECT_ROOT=/pritish/workspace/gemma-post-training-kaggle
+export GEMMA_RL_ROOT=$GEMMA_PROJECT_ROOT/outputs/rl/gemma-grpo-hor1-20261029
+PYTHONPATH=. $GEMMA_PROJECT_ROOT/.runtime/venvs/rl-gemma-20261029/bin/python \
+  -u verl/extensions/gemma/rl_launch.py
+```
+
+| RL runtime | Pin / limit |
+|---|---|
+| Python / PyTorch / vLLM | 3.12 / 2.10.0+cu128 / 0.19.1 |
+| Ray / TransferQueue / CuPy | 2.59.0 / 0.1.11 / cupy-cuda12x13.6.0 |
+| Placement | Two trainer GPUs; six standalone TP1 rollout replicas |
+| Training / validation | Eight public-test pytest issues; 221 separate executable dev issues |
+| Rollouts / objective | Eight episodes per issue; GRPO; LR1e-6; fixed step25 KL reference |
+| Safety bound | Two collection/update cycles; 64-turn PPO minibatches; six hours; isolated Ray cluster |
+| Logging | `GEMMA_RL_ROOT/tensorboard`; complete trajectories retained; judge offline |
+| Launch ownership | One launcher only; inspect existing launch receipts before starting |
 
 Inspect/override the complete recipe without launching training:
 
@@ -28,7 +49,7 @@ python -m verl.trainer.generation_sft --config-name gemma_sft --cfg job \
 ```
 
 Native `sft_trainer_engine` remains available for other models. Gemma-specific
-head hooks support SFT only; they must not be enabled for PPO/RL losses.
+SFT selected-head hooks remain SFT-only. RL uses `rl_head.py` for full-vocabulary response logprobs and entropy.
 
 Running `python -m verl.trainer.generation_sft` prints the phase plan. Execution
 requires `workflow.execute=true` plus a qualified panel and evaluator implementing

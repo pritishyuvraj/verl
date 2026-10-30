@@ -731,10 +731,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
             qat = getattr(getattr(self.actor.engine, "engine_config", None), "qat", None)
-            weight_quantizer = dispatch_rollout_weight_quantizer(
-                model_config=model_config,
-                rollout_config=self.config.rollout,
-                qat_config=qat,
+            from verl.extensions.gemma.rl_sync import enabled as packed_adapter_sync
+            weight_quantizer = None if packed_adapter_sync(model_config) else dispatch_rollout_weight_quantizer(
+                model_config=model_config, rollout_config=self.config.rollout, qat_config=qat,
             )
             if weight_quantizer is not None:
                 self.actor.engine.set_rollout_weight_quantizer(weight_quantizer)
@@ -813,7 +812,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # snapshot prime), so it drives the training engine itself.
                 metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
             else:
-                per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+                from verl.extensions.gemma.rl_sync import enabled as packed_adapter_sync, weights as adapter_weights
+                if packed_adapter_sync(self.actor.engine.model_config):
+                    per_tensor_param = adapter_weights(self.actor.engine)
+                else:
+                    per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
                 metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             if self.actor.engine.is_param_offload_enabled:
                 self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)

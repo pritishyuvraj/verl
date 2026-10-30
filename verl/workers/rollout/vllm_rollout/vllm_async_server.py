@@ -322,7 +322,10 @@ class vLLMHttpServer:
         effective_quantization_config = hf_overrides.get("quantization_config") or hf_quantization_config
         from verl.utils.vllm.vllm_quant_utils import set_default_vllm_quantization_backends
 
-        set_default_vllm_quantization_backends(effective_quantization_config, engine_kwargs)
+        if not self.model_config.rl_head_chunk_size:
+            set_default_vllm_quantization_backends(effective_quantization_config, engine_kwargs)
+        # Packed Gemma uses vLLM's native INT4 kernel selection. The generic
+        # DeepGEMM override targets newer FP8 runtimes, not this pinned W4A16 path.
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
@@ -694,6 +697,8 @@ class vLLMHttpServer:
         if self.lora_as_adapter:
             # Make sure we also check that the lora is already loaded in the engine
             lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+            if self.model_config.rl_head_chunk_size and not lora_loaded:
+                raise RuntimeError("Gemma RL adapter is not loaded; refusing untuned-base generation")
             if lora_loaded:
                 lora_request = LoRARequest(
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
@@ -1412,6 +1417,9 @@ class vLLMHttpServer:
 
     def _get_worker_extension_cls(self) -> str:
         """Return the fully-qualified colocate worker extension class name."""
+        from verl.extensions.gemma.rl_sync import enabled
+        if enabled(self.model_config):
+            return "verl.extensions.gemma.rl_worker.PackedGemmaLoRAWorkerExtension"
         return "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension"
 
     def _get_cli_modules(self) -> list:
