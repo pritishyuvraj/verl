@@ -156,6 +156,7 @@ class GemmaSWEAgentLoop(AgentLoopBase):
             await site.start()
             port = site._server.sockets[0].getsockname()[1]
             request = {"project_root":str(project),"output":str(out),"task":task,
+                       "launch_owner":os.environ["GEMMA_RL_OWNER"],
                        "image":metadata["images"][task_id],"bundle":str(root/"bundle"),
                        "endpoint":f"http://127.0.0.1:{port}/v1","fixture_index":metadata.get("fixture_index")}
             (out/"episode-request.json").write_text(json.dumps(request))
@@ -194,6 +195,7 @@ class GemmaSWEAgentLoop(AgentLoopBase):
                 raise RuntimeError("No ordinary policy actions were generated")
             audit_hash = hashlib.sha256(f"{cfg.audit_seed}:{partition}:{task_id}:{kwargs['session_id']}".encode()).digest()
             (out/"completed.json").write_text(json.dumps({"task":task_id,"uid":kwargs["uid"],"session":kwargs["session_id"],
+                "launch_owner":os.environ["GEMMA_RL_OWNER"],
                 "reward":reward,"turns":len(token_turns),"seconds":time.monotonic()-start,"judge":"offline",
                 "context_errors":budget_errors,"offline_audit_selected":
                     int.from_bytes(audit_hash[:8],"big") / 2**64 < cfg.audit_fraction_per_outcome,

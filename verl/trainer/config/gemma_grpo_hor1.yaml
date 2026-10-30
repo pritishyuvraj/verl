@@ -114,6 +114,8 @@ actor_rollout_ref:
       vllm:
         language_model_only: true
         reasoning_parser: gemma4
+        # Same delimiters supplied automatically by official ADK VllmServer.
+        reasoning_config: '{"reasoning_start_str":"<|channel>","reasoning_end_str":"<channel|>"}'
         enable_auto_tool_choice: true
         tool_call_parser: gemma4
         lora_dtype: bfloat16

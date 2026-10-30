@@ -179,4 +179,12 @@ def main():
 
 
 if __name__ == "__main__":
+    import signal
+    stopping = False
+    def stop(signum, frame):
+        global stopping
+        if not stopping:
+            stopping = True
+            raise KeyboardInterrupt("Owned grading deadline; unwind exact-container cleanup")
+    signal.signal(signal.SIGTERM, stop)
     main()

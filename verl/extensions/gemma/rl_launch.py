@@ -8,6 +8,54 @@ import subprocess
 import sys
 import time
 import uuid
+import ctypes
+import platform
+from concurrent.futures import ThreadPoolExecutor
+
+
+def pidfd_open(pid):
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    if platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"):
+        raise RuntimeError("Identity-safe process cleanup is unsupported on this platform")
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.syscall(434, int(pid), 0)
+    if fd < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return fd
+
+
+def pidfd_signal(fd, sig):
+    if hasattr(signal, "pidfd_send_signal"):
+        return signal.pidfd_send_signal(fd, sig)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.syscall(424, int(fd), int(sig), ctypes.c_void_p(), 0) < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def cleanup_containers(root, token, attempt):
+    cli = ["docker", "-H", "unix:///dev/shm/pritish-gemma4-20261025/eval-docker/docker.sock"]
+    assert subprocess.check_output(cli+["info", "--format", "{{.ID}}"], text=True, timeout=10).strip() == (
+        "9469315a-6cc5-4032-a513-6427b656879d")
+    ids = subprocess.check_output(cli+["ps", "-aq"], text=True, timeout=10).split()
+    if len(ids) > 256:
+        raise RuntimeError("Unexpected container inventory; refuse broad cleanup")
+    containers = json.loads(subprocess.check_output(cli+["inspect", *ids], timeout=15)) if ids else []
+    allowed_images = set()
+    for name in ("environment-admission.json", "dev-admission.json"):
+        allowed_images.update(v["image_id"] for v in json.loads((root/name).read_text())["images"].values())
+    owned = [c for c in containers if "GEMMA_RL_OWNER="+token in c["Config"].get("Env", [])]
+    for c in owned:
+        if c["Image"] not in allowed_images or c["HostConfig"]["NetworkMode"] != "none":
+            raise RuntimeError("Owned container metadata changed; refuse signal")
+    write(attempt/"container-cleanup-intent.json", {"owner":token,"ids":[c["Id"] for c in owned]})
+    def remove(c):
+        subprocess.run(cli+["rm","--force",c["Id"]],check=True,timeout=10,stdout=subprocess.DEVNULL)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(remove, owned))
+    write(attempt/"container-cleanup.json", {"owner":token,"removed":[c["Id"] for c in owned]})
 
 
 def sha(path):
@@ -70,12 +118,14 @@ def main():
     def terminate(sig):
         for pid, start in owned().items():
             try:
-                fd = os.pidfd_open(pid)
-                now = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19]
-                if now != start:
-                    raise RuntimeError("Owned process identity changed")
-                signal.pidfd_send_signal(fd, sig)
-                os.close(fd)
+                fd = pidfd_open(pid)
+                try:
+                    now = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19]
+                    if now != start:
+                        raise RuntimeError("Owned process identity changed")
+                    pidfd_signal(fd, sig)
+                finally:
+                    os.close(fd)
             except (FileNotFoundError, ProcessLookupError):
                 continue
 
@@ -103,6 +153,7 @@ def main():
         terminate(signal.SIGKILL)
         time.sleep(2)
         survivors = owned()
+        cleanup_containers(root, token, attempt)
         receipt.update(state="completed" if code == 0 and not survivors else "failed",
                        returncode=code, finished=time.time(), remaining_owned=survivors,
                        observed_processes=known)

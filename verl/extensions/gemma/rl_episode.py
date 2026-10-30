@@ -45,9 +45,12 @@ def main():
         profile = fixture_helper.load_profile(Path(request["fixture_index"]))
 
     def factory(image):
+        environment = {**helper.environment(image["python_prefix"]),
+                       "GEMMA_RL_OWNER": os.environ["GEMMA_RL_OWNER"],
+                       "GEMMA_RL_EPISODE": str(out)}
         manager = ContainerManager(ContainerConfig(image=image["image"], network_mode="none", mem_limit="4g",
                     cpu_quota=200000, working_dir="/workspace", timeout_seconds=300,
-                    environment=helper.environment(image["python_prefix"])))
+                    environment=environment))
         return fixture_helper.FixtureManager(manager, profile) if profile else manager
 
     prepared = out / "adapter"
@@ -96,7 +99,11 @@ def main():
 
 if __name__ == "__main__":
     import signal
+    stopping = False
     def stop(signum, frame):
-        raise KeyboardInterrupt("Owned episode deadline; unwind official sandbox cleanup")
+        global stopping
+        if not stopping:
+            stopping = True
+            raise KeyboardInterrupt("Owned episode deadline; unwind official sandbox cleanup")
     signal.signal(signal.SIGTERM, stop)
     main()
