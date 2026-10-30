@@ -21,8 +21,9 @@ class RecoveryTest(unittest.TestCase):
             claims.claim(manifest, task='task', uid='uid0', session=0, validate=False, step=0)
         with self.assertRaisesRegex(ValueError, 'exhausted'):
             claims.claim(manifest, task='task', uid='uid2', session=0, validate=False, step=1)
+        self.assertIsNone(claims.claim(manifest, task='task', uid='uid2', session=0, validate=False, step=2))
         with self.assertRaisesRegex(ValueError, 'version lag'):
-            claims.claim(manifest, task='task', uid='uid2', session=0, validate=False, step=2)
+            claims.claim(manifest, task='task', uid='uid2', session=0, validate=False, step=-1)
         self.assertEqual(claims.claim(manifest, task='devtask', uid='d', session=0, validate=True, step=0), 'devrecord')
         self.assertIsNone(claims.claim(manifest, task='devtask', uid='d', session=0, validate=True, step=1))
 

@@ -3,7 +3,7 @@ import unittest
 import torch
 from tensordict import TensorDict
 
-from verl.extensions.gemma.rl_head import _forward, chunk_statistics, prepare_inputs, restore_outputs
+from verl.extensions.gemma.rl_head import _forward, chunk_statistics, prepare_inputs, restore_outputs, frozen_projection
 
 
 class PolicyHeadTest(unittest.TestCase):
@@ -59,7 +59,8 @@ class PolicyHeadTest(unittest.TestCase):
         self.assertEqual(positions.numel(), 0)
         decoder = torch.nn.Embedding(8, 7)
         model = SimpleNamespace(model=lambda **kwargs: SimpleNamespace(
-            last_hidden_state=decoder(sample['input_ids'].unsqueeze(0))))
+            last_hidden_state=decoder(sample['input_ids'].unsqueeze(0))),
+            lm_head=torch.nn.Linear(7, 8, bias=False).requires_grad_(False))
         raw = _forward(model, **inputs)
         result = restore_outputs(raw, data, positions)
         loss = result['log_probs'].values().sum() + result['entropy'].values().sum()
@@ -67,6 +68,21 @@ class PolicyHeadTest(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(decoder.weight.grad)
         self.assertEqual(decoder.weight.grad.abs().sum().item(), 0)
+
+    def test_recomputation_uses_original_frozen_values(self):
+        torch.manual_seed(12)
+        head = torch.nn.Linear(7, 31, bias=False).double().requires_grad_(False)
+        a = torch.randn(13, 7, dtype=torch.float64, requires_grad=True)
+        b = a.detach().clone().requires_grad_(True)
+        labels = torch.randint(31, (13,))
+        expected, entropy = chunk_statistics(head, a, labels, chunk_size=3)
+        (expected.sum() + .03*entropy.sum()).backward()
+        actual, entropy = chunk_statistics(frozen_projection(head), b, labels, chunk_size=3)
+        # Simulate FSDP replacing/releasing the module parameter between passes.
+        head.weight = torch.nn.Parameter(torch.zeros_like(head.weight), requires_grad=False)
+        (actual.sum() + .03*entropy.sum()).backward()
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(a.grad, b.grad)
 
     def test_bad_masks_refused(self):
         for mask in ([1, 2], [1]):

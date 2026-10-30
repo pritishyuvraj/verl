@@ -15,6 +15,11 @@ class CompletedClaims:
     def claim(self, manifest, *, task, uid, session, validate, step):
         if validate:
             return manifest['dev'][task] if int(step) == 0 else None
+        if int(step) > 1:
+            # Native async sampling may evict prefetched initial-policy groups
+            # after an update. Its refill must generate using the updated policy,
+            # never relabel or replay initial-policy data as fresh experience.
+            return None
         if int(step) not in (0, 1):
             raise ValueError('Saved initial-policy training groups exceed allowed version lag')
         key = (task, uid)

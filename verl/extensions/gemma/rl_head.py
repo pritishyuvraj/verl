@@ -9,6 +9,27 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 
+def frozen_projection(head):
+    """Snapshot frozen values before backward can reshard the module's parameters.
+
+    Recomputing ``head(h)`` inside a checkpoint can observe a DTensor after
+    FSDP's forward hooks have finished. The snapshot owns its storage; backward
+    never reads mutable module parameter attributes or freed all-gather buffers.
+    All ranks take this path, including rows with a zero response mask.
+    """
+    from torch.distributed.tensor import DTensor
+    if head.weight.requires_grad or (head.bias is not None and head.bias.requires_grad):
+        raise ValueError('The Gemma vocabulary head must remain frozen')
+    def snapshot(value):
+        if value is None:
+            return None
+        if isinstance(value, DTensor):
+            value = value.full_tensor()
+        return value.detach().clone()
+    weight, bias = snapshot(head.weight), snapshot(head.bias)
+    return lambda hidden: torch.nn.functional.linear(hidden, weight, bias)
+
+
 def chunk_statistics(head, hidden, labels, *, chunk_size=32, temperature=1.0, softcap=None):
     if chunk_size < 1 or temperature <= 0:
         raise ValueError("Positive chunk size and temperature are required")
@@ -43,6 +64,7 @@ def _forward(self, *args, gemma_rl_positions=None, gemma_rl_labels=None, gemma_r
     hidden = outputs.last_hidden_state
     if hidden.shape[0] != 1:
         raise ValueError("Gemma RL head requires microbatch size one")
+    projection = frozen_projection(self.lm_head)
     hidden = hidden[0].index_select(0, gemma_rl_positions)
     if gemma_rl_positions.numel() == 0:
         # Native multi-trajectory balancing adds all-masked padding rows. Keep
@@ -51,7 +73,7 @@ def _forward(self, *args, gemma_rl_positions=None, gemma_rl_labels=None, gemma_r
         empty = hidden.float().sum(dim=-1) * 0.0
         return SimpleNamespace(gemma_log_probs=empty, gemma_entropy=empty)
     logp, entropy = chunk_statistics(
-        self.lm_head, hidden, gemma_rl_labels,
+        projection, hidden, gemma_rl_labels,
         chunk_size=self._gemma_rl_chunk_size,
         temperature=gemma_rl_temperature,
         softcap=self.config.get_text_config().final_logit_softcapping,
