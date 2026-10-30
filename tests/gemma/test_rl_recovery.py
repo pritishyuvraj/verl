@@ -4,10 +4,53 @@ import re
 import tempfile
 import unittest
 
-from verl.extensions.gemma.rl_recovery import context_budget_error, grade_run_id, output_cap, recover_initial, sha
+from verl.extensions.gemma.rl_recovery import (context_budget_error, grade_run_id, output_cap,
+                                             recover_initial, recover_completed, CompletedClaims, sha)
 
 
 class RecoveryTest(unittest.TestCase):
+    def test_whole_group_claims_preserve_sessions_and_versions(self):
+        groups = [{str(i): f'{g}-{i}' for i in range(8)} for g in range(2)]
+        manifest = {'dev':{'devtask':'devrecord'}, 'train':{'task':groups}}
+        claims = CompletedClaims()
+        for group in range(2):
+            for session in reversed(range(8)):
+                self.assertEqual(claims.claim(manifest, task='task', uid=f'uid{group}', session=session,
+                    validate=False, step=group), f'{group}-{session}')
+        with self.assertRaisesRegex(ValueError, 'already recovered'):
+            claims.claim(manifest, task='task', uid='uid0', session=0, validate=False, step=0)
+        with self.assertRaisesRegex(ValueError, 'exhausted'):
+            claims.claim(manifest, task='task', uid='uid2', session=0, validate=False, step=1)
+        with self.assertRaisesRegex(ValueError, 'version lag'):
+            claims.claim(manifest, task='task', uid='uid2', session=0, validate=False, step=2)
+        self.assertEqual(claims.claim(manifest, task='devtask', uid='d', session=0, validate=True, step=0), 'devrecord')
+        self.assertIsNone(claims.claim(manifest, task='devtask', uid='d', session=0, validate=True, step=1))
+
+    def test_completed_recovery_retains_reward_and_behavior(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); source=root/'episodes/train/old'; source.mkdir(parents=True)
+            out=root/'new';out.mkdir();config=root/'config';config.write_text('fixed')
+            task={'instance_id':'task'}
+            files={'episode-request.json':{'task':task}, 'grade/reward.json':{'resolved':True},
+                   'completed.json':{'launch_owner':'owner','task':'task','reward':1.,'seconds':12.,
+                                     'uid':'oldgroup','session':3,'context_errors':[]},
+                   'request-000.json':{'max_completion_tokens':16384},
+                   'response-000.json':{'prompt_ids':[2,3],'response_ids':[4],'log_probs':[-.1],
+                                        'extra_fields':{'min_global_steps':0,'max_global_steps':0}}}
+            for name,value in files.items():
+                path=source/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(json.dumps(value))
+            record={'path':'episodes/train/old','files':{name:sha(source/name) for name in files},'evidence':{}}
+            manifest={'config_sha256':sha(config),'inputs':{},'source_owner':'owner'}
+            (root/'completed-episode-recovery.json').write_text(json.dumps(manifest))
+            turns,seconds,errors=recover_completed(root,task,out,record,config_path=config)
+            self.assertEqual(seconds,12.)
+            self.assertEqual(turns[0]['extra_fields']['max_global_steps'],0)
+            self.assertTrue(json.loads((out/'grade/reward.json').read_text())['resolved'])
+            self.assertFalse((out/'completed.json').exists())
+            (source/'grade/reward.json').write_text('{"resolved":false}')
+            with self.assertRaisesRegex(ValueError,'artifact changed'):
+                recover_completed(root,task,out,record,config_path=config)
+
     def test_official_output_cap_alias(self):
         self.assertEqual(output_cap({'max_completion_tokens':16384}),16384)
         self.assertEqual(output_cap({'max_tokens':16384}),16384)

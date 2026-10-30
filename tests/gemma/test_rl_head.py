@@ -3,7 +3,7 @@ import unittest
 import torch
 from tensordict import TensorDict
 
-from verl.extensions.gemma.rl_head import chunk_statistics, prepare_inputs, restore_outputs
+from verl.extensions.gemma.rl_head import _forward, chunk_statistics, prepare_inputs, restore_outputs
 
 
 class PolicyHeadTest(unittest.TestCase):
@@ -46,6 +46,34 @@ class PolicyHeadTest(unittest.TestCase):
     def test_empty_response_refused(self):
         with self.assertRaises(ValueError):
             chunk_statistics(torch.nn.Linear(7, 31), torch.empty(0, 7), torch.empty(0, dtype=torch.long))
+
+    def test_native_padding_forward_backward_contributes_zero(self):
+        from types import SimpleNamespace
+        from verl.trainer.ppo.padding_utils import construct_minimal_padding_template
+        sample, tag = construct_minimal_padding_template({}, {}, eos_token_id=1)
+        self.assertTrue(tag['is_padding'])
+        data = TensorDict({key: torch.nested.nested_tensor([sample[key]], layout=torch.jagged)
+                           for key in ('input_ids', 'responses', 'response_mask')}, batch_size=[1])
+        inputs = {}
+        positions = prepare_inputs(data, inputs, {'temperature': torch.tensor([1.0])})
+        self.assertEqual(positions.numel(), 0)
+        decoder = torch.nn.Embedding(8, 7)
+        model = SimpleNamespace(model=lambda **kwargs: SimpleNamespace(
+            last_hidden_state=decoder(sample['input_ids'].unsqueeze(0))))
+        raw = _forward(model, **inputs)
+        result = restore_outputs(raw, data, positions)
+        loss = result['log_probs'].values().sum() + result['entropy'].values().sum()
+        self.assertEqual(loss.item(), 0)
+        loss.backward()
+        self.assertIsNotNone(decoder.weight.grad)
+        self.assertEqual(decoder.weight.grad.abs().sum().item(), 0)
+
+    def test_bad_masks_refused(self):
+        for mask in ([1, 2], [1]):
+            data = TensorDict({key: torch.nested.nested_tensor([torch.tensor(value)], layout=torch.jagged)
+                for key, value in {'input_ids':[1,2,3], 'responses':[2,3], 'response_mask':mask}.items()}, batch_size=[1])
+            with self.assertRaisesRegex(ValueError, 'Response mask'):
+                prepare_inputs(data, {}, {'temperature':torch.tensor([1.0])})
 
 
 if __name__ == "__main__":

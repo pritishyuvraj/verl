@@ -8,7 +8,8 @@ from pathlib import Path
 import time
 import uuid
 
-from verl.extensions.gemma.rl_recovery import output_cap, context_budget_error, grade_run_id, recover_initial
+from verl.extensions.gemma.rl_recovery import (output_cap, context_budget_error, grade_run_id,
+                                             recover_initial, recover_completed, CompletedClaims)
 
 from aiohttp import web
 import ray
@@ -20,6 +21,12 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutp
 class EpisodeCapacity:
     def __init__(self, episodes, graders):
         self.slots = {"episode": asyncio.Semaphore(episodes), "grade": asyncio.Semaphore(graders)}
+        self.recovery_claims = CompletedClaims()
+    def claim_recovery(self, root, **kwargs):
+        path = Path(root) / 'completed-episode-recovery.json'
+        if not path.exists():
+            return None
+        return self.recovery_claims.claim(json.loads(path.read_text()), **kwargs)
     async def acquire(self, kind):
         await self.slots[kind].acquire()
     def release(self, kind):
@@ -68,6 +75,12 @@ class GemmaSWEAgentLoop(AgentLoopBase):
         out = root / "episodes" / partition / identifier
         out.mkdir(parents=True, exist_ok=False)
         token_turns, faults, budget_errors = [], [], []
+        record = await capacity.claim_recovery.remote(str(root), task=task_id, uid=kwargs['uid'],
+            session=kwargs['session_id'], validate=validate, step=kwargs['global_steps'])
+        if record is not None:
+            turns, seconds, errors = recover_completed(root, task, out, record,
+                config_path=Path(__file__).parents[2]/'trainer/config/gemma_grpo_hor1.yaml')
+            return self._finish(out, turns, errors, time.monotonic()-seconds, partition, task_id, kwargs)
         recovered = recover_initial(root, task, out, validate=validate, step=kwargs["global_steps"],
             config_path=Path(__file__).parents[2]/"trainer/config/gemma_grpo_hor1.yaml")
         if recovered is not None:

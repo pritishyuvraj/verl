@@ -44,6 +44,12 @@ def _forward(self, *args, gemma_rl_positions=None, gemma_rl_labels=None, gemma_r
     if hidden.shape[0] != 1:
         raise ValueError("Gemma RL head requires microbatch size one")
     hidden = hidden[0].index_select(0, gemma_rl_positions)
+    if gemma_rl_positions.numel() == 0:
+        # Native multi-trajectory balancing adds all-masked padding rows. Keep
+        # the decoder's autograd graph so every FSDP rank still participates in
+        # backward, while contributing exactly zero tokens and gradients.
+        empty = hidden.float().sum(dim=-1) * 0.0
+        return SimpleNamespace(gemma_log_probs=empty, gemma_entropy=empty)
     logp, entropy = chunk_statistics(
         self.lm_head, hidden, gemma_rl_labels,
         chunk_size=self._gemma_rl_chunk_size,
@@ -69,10 +75,15 @@ def prepare_inputs(micro_batch, model_inputs, output_args):
         raise ValueError("Gemma RL requires one unpadded episode turn per microbatch")
     sequence = micro_batch["input_ids"].values()
     response = micro_batch["responses"].values()
+    if response.numel() == 0:
+        raise ValueError("A policy sample must contain generated tokens")
     prompt_length = sequence.numel() - response.numel()
     if prompt_length < 1 or not torch.equal(sequence[prompt_length:], response):
         raise ValueError("Input/response token alignment mismatch")
-    mask = micro_batch["response_mask"].values().bool()
+    mask = micro_batch["response_mask"].values()
+    if mask.shape != response.shape or not torch.all((mask == 0) | (mask == 1)):
+        raise ValueError("Response mask must be binary and aligned with response tokens")
+    mask = mask.bool()
     selected = torch.where(mask)[0]
     positions = selected + prompt_length - 1
     temperature = output_args["temperature"].flatten()
