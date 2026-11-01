@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import time
 from pathlib import Path
 
 
@@ -20,6 +21,10 @@ def main():
     p.add_argument("--request", type=Path, required=True)
     a = p.parse_args()
     request = json.loads(a.request.read_text())
+    episode = request.get("episode", {})
+    minutes = episode.get("minutes", 5)
+    context = episode.get("context", 32768)
+    started = time.monotonic()
     root = Path(request["project_root"])
     out = Path(request["output"])
     helper_path = root / "outputs/runtime/gemma-relaxed-128k-60m-20261027-attempt004-baseline-continuation/diagnostic_agent_prepare.py"
@@ -63,27 +68,32 @@ def main():
     if endpoint.hostname != "127.0.0.1":
         raise RuntimeError("Only the local native-verl bridge may serve rollouts")
     server = VllmServer(VllmConfig(model="gemma-rl", host="127.0.0.1", port=endpoint.port,
-                                  tool_call_parser="gemma4", reasoning_parser="gemma4", max_model_len=32768),
+                                  tool_call_parser="gemma4", reasoning_parser="gemma4", max_model_len=context),
                          adapter_manifest=adapters)
     models = server.create_model_registry(aliases=[helper.MODEL_NAME], model_prefix="openai/", api_key="local-only")
     for alias in models.list_available():
         model = models.get(alias)
         if not isinstance(model, LiteLlm):
             raise RuntimeError("Expected the official LiteLLM transport")
-        model._additional_args["timeout"] = 330
+        model._additional_args["timeout"] = minutes * 60 + 100
         model._additional_args["num_retries"] = 0
+        if "rank" in request:
+            model._additional_args["extra_headers"] = {
+                "X-data-parallel-rank": str(request["rank"]),
+                "X-Episode-ID": request["episode_id"],
+            }
     limits, generation = build_submission_limits()
     wheels = prepared / "empty_wheels"
     wheels.mkdir()
     config = EvalConfig(tasks_path=a.request, snapshots_dir=snapshot.parent, results_dir=out,
         submission_dir=bundle, models=models, sandbox="docker", image=image["image"], wheels_dir=wheels,
         graph_dir=str(prepared/"absent_graph"), embeddings_dir=str(prepared/"absent_embeddings"),
-        max_time_minutes=5, max_tool_calls=60, max_turns=60, timeout_seconds=300,
+        max_time_minutes=minutes, max_tool_calls=60, max_turns=60, timeout_seconds=300,
         verification_timeout_seconds=300, limits=limits, generation_constraints=generation,
         adapter_manifest=adapters, display_mode="quiet",
         context_cache_config=ContextCacheConfig(min_tokens=2048, ttl_seconds=1800, cache_intervals=10),
         events_compaction_config=EventsCompactionConfig(compaction_interval=1, overlap_size=2,
-                                                        token_threshold=24576, event_retention_size=5))
+                                                        token_threshold=episode.get("compaction_threshold", 24576), event_retention_size=5))
     manager = helper.EnvironmentAdapter(factory(image), image)
     try:
         with helper.checked_setup_directory(setup):
@@ -92,7 +102,8 @@ def main():
         trace.save(out/"trace.json")
         (out/"agent.patch").write_text(patch or "")
         (out/"generation.json").write_text(json.dumps({"instance_id":task["instance_id"],"error":error,
-                                                        "empty_patch":not bool((patch or "").strip())},indent=2))
+                                                        "empty_patch":not bool((patch or "").strip()),
+                                                        "seconds":time.monotonic()-started},indent=2))
     finally:
         manager.cleanup_all()
 

@@ -1,0 +1,44 @@
+# Inference only. Same eight seeds and executable tests for both checkpoints.
+project: /pritish/workspace/gemma-post-training-kaggle
+output: /pritish/workspace/gemma-post-training-kaggle/outputs/eval/swerebench-pass8-20261101
+python: /pritish/workspace/gemma-post-training-kaggle/.runtime/venvs/scorer-v31/bin/python
+model: /pritish/workspace/gemma-post-training-kaggle/.runtime/models/kaggle-e4b-v2
+adapter: /pritish/workspace/gemma-post-training-kaggle/outputs/rl/gemma-grpo-hor1-20261029/initial-adapter
+adapter_sha256: b545e114ce31262cf455e8545b7d405b9a63fc1e9c78b3ffb4027a5bed77cf79
+bundle: /pritish/workspace/gemma-post-training-kaggle/outputs/rl/gemma-grpo-hor1-20261029/bundle
+harness_revision: 980d0cca8aa4e73f1d9f894e906370bef8c4de8a
+seeds: [42, 43, 44, 45, 46, 47, 48, 49]
+arms: [baseline, sft_step25]
+inference:
+  dp: 8
+  tp: 1
+  concurrent_episodes: 128
+  max_num_seqs: 256
+  max_num_batched_tokens: 65536
+  gpu_memory_utilization: 0.90
+  language_model_only: true
+  context: 131072
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64
+  thinking_tokens: 4096
+  output_tokens: 16384
+episode:
+  minutes: 60
+  context: 131072
+  compaction_threshold: 98304
+  # Tools and assistant turns are each capped at 60, matching the relaxed reference.
+environment:
+  issues_per_batch: 8
+  grading_workers: 8
+  pull_seconds: 900
+  test_seconds: 600
+  scratch_floor_gib: 24
+  disk_floor_gib: 20
+  # Remove only images first acquired by this experiment, after both arms are graded.
+  release_owned_images: true
+  build_missing_images: false  # Coverage stays pending until build qualification succeeds.
+wall_seconds: 86400  # Finite first slice; saved episodes are never regenerated.
+trajectories: all_compressed
+raw_http_sample_fraction: 0.10
+judge: offline
