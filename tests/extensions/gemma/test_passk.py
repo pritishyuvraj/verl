@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 import concurrent.futures
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import time
 
 PATH = Path(__file__).resolve().parents[3]/"verl/extensions/gemma/passk.py"
@@ -69,6 +69,58 @@ class ProgressTests(unittest.TestCase):
             with patch.object(Path, "read_text", side_effect=PermissionError("denied")):
                 with self.assertRaises(PermissionError):
                     module.private_snapshot(12345)
+
+
+class ImageReleaseTests(unittest.TestCase):
+    def experiment(self, tmp):
+        e = object.__new__(module.Experiment)
+        e.out = Path(tmp)
+        e.c = {"environment":{"release_owned_images":True,"pull_seconds":10}}
+        e.client = Mock()
+        e.client.images.get.return_value = Mock(id="owned-id")
+        e.client.containers.list.return_value = []
+        e.acquired_images = {}
+        e.initial_images = set()
+        e.capacity = Mock()
+        e.bounded = Mock()
+        e.run_grade = Mock(return_value={"resolved":False,"tests_executed":True})
+        return e
+
+    def test_preexisting_image_never_becomes_owned(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {"docker":Mock()}):
+            e = self.experiment(tmp)
+            with self.assertRaises(module.QualificationRejected):
+                e.qualify({"instance_id":"task","image_name":"image:latest","patch":"synthetic"})
+            self.assertEqual(e.acquired_images, {})
+            e.bounded.assert_not_called()
+
+    def test_failed_control_retains_acquisition_for_cleanup(self):
+        class NotFound(Exception): pass
+        fake = Mock()
+        fake.errors.ImageNotFound = NotFound
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {"docker":fake}):
+            e = self.experiment(tmp)
+            e.client.images.get.side_effect = [NotFound(),Mock(id="owned-id")]
+            with self.assertRaises(module.QualificationRejected):
+                e.qualify({"instance_id":"task","image_name":"image:latest","patch":"synthetic"})
+            self.assertEqual(e.acquired_images['task']['image_id'], 'owned-id')
+            self.assertTrue((e.out/'qualification/task/acquired-image.json').exists())
+
+    def test_release_refuses_active_containers_and_changed_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = self.experiment(tmp)
+            e.acquired_images['task'] = {'image':'image:latest','image_id':'owned-id'}
+            e.client.containers.list.return_value = [Mock()]
+            with self.assertRaises(RuntimeError): e.release_image('task')
+            e.client.images.remove.assert_not_called()
+            e.client.containers.list.return_value = []
+            e.client.images.get.return_value = Mock(id='changed')
+            with self.assertRaises(RuntimeError): e.release_image('task')
+            e.client.images.remove.assert_not_called()
+            e.client.images.get.return_value = Mock(id='owned-id')
+            e.release_image('task')
+            e.client.images.remove.assert_called_once_with('image:latest',force=False,noprune=True)
+            self.assertEqual(e.acquired_images, {})
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux process identity qualification")

@@ -278,6 +278,7 @@ class Experiment:
         self.attempt = self.out/"attempts"/str(time.time_ns())
         self.attempt.mkdir(parents=True, exist_ok=False)
         self.services = []
+        self.acquired_images = {}
         self.initial_images = {i.id for i in self.client.images.list()}
         self.grade_slots = threading.Semaphore(config["environment"]["grading_workers"])
         self.rank_slots = [threading.Semaphore(config["inference"]["concurrent_episodes"]//8) for _ in range(8)]
@@ -327,6 +328,19 @@ class Experiment:
                          self.c["environment"]["test_seconds"]+180, grading=True)
         return json.loads((out/"outcome.json").read_text())
 
+    def release_image(self, task):
+        entry = self.acquired_images.get(task)
+        if entry is None or not self.c["environment"]["release_owned_images"]:
+            return
+        image = self.client.images.get(entry["image"])
+        if image.id != entry["image_id"]:
+            raise RuntimeError("Owned image changed; refuse removal")
+        if self.client.containers.list(all=True, filters={"ancestor":image.id}):
+            raise RuntimeError("Owned image has a container; refuse removal")
+        self.client.images.remove(entry["image"], force=False, noprune=True)
+        write(self.out/"qualification"/task/"image-release.json", entry | {"released_unix":time.time()})
+        del self.acquired_images[task]
+
     def qualify(self, row):
         task = row["instance_id"]
         directory = self.out/"qualification"/task
@@ -358,6 +372,9 @@ class Experiment:
             self.bounded(["docker", "-H", DOCKER, "pull", name], directory/"pull.log",
                          self.c["environment"]["pull_seconds"])
             image = self.client.images.get(name)
+            if image.id not in self.initial_images:
+                self.acquired_images[task] = {"image":name,"image_id":image.id}
+                write(directory/"acquired-image.json", self.acquired_images[task])
         self.capacity()
         entry = {"image": name, "image_id": image.id, "python_prefix": "/opt/miniconda3/envs/testbed"}
         for label, patch in (("gold", row["patch"]), ("neutral", NEUTRAL)):
@@ -529,10 +546,7 @@ class Experiment:
                 row,image,jobs=item
                 for f in cf.as_completed(jobs):
                     f.result()
-                if self.c["environment"]["release_owned_images"] and image["image_id"] not in self.initial_images:
-                    if self.client.containers.list(all=True,filters={"ancestor":image["image_id"]}):
-                        raise RuntimeError("Image still has a container; refuse removal")
-                    self.client.images.remove(image["image"],force=False,noprune=False)
+                self.release_image(row["instance_id"])
             with cf.ThreadPoolExecutor(max_workers=self.c["inference"]["concurrent_episodes"]) as pool:
                 for line in (self.out/"private/tasks.jsonl").open():
                     row = json.loads(line)
@@ -549,10 +563,12 @@ class Experiment:
                     except QualificationRejected as e:
                         write(self.out/"qualification"/row["instance_id"]/"failure.json",{
                             "error":repr(e),"model_attempts":0,"classification":"failed_reference_control"})
+                        self.release_image(row["instance_id"])
                         consecutive_failures = 0
                         continue
                     except Exception as e:
                         write(self.out/"qualification"/row["instance_id"]/"failure.json",{"error":repr(e),"model_attempts":0})
+                        self.release_image(row["instance_id"])
                         consecutive_failures += 1
                         if consecutive_failures >= 3:
                             raise RuntimeError("Three consecutive environment failures; inspect before further launches") from e
@@ -572,6 +588,12 @@ class Experiment:
             raise
         finally:
             cleanup_errors=[]
+            # The executor has joined all episode workers before this point.
+            for task in list(self.acquired_images):
+                try:
+                    self.release_image(task)
+                except Exception as error:
+                    cleanup_errors.append({"task":task,"error":repr(error)})
             for p,group in reversed(self.services):
                 try:
                     group.cleanup()
