@@ -1,0 +1,11 @@
+--- a/vllm/tool_parsers/gemma4_tool_parser.py
++++ b/vllm/tool_parsers/gemma4_tool_parser.py
+@@ -273,6 +273,8 @@
+             val_start = i
+             while i < n and arr_str[i] not in (",", "]"):
+                 i += 1
++            if i == val_start:
++                raise ValueError("Unexpected closing bracket in Gemma4 array")
+             if partial and i >= n:
+                 break
+             items.append(_parse_gemma4_value(arr_str[val_start:i]))
