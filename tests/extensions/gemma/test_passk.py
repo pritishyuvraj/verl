@@ -123,6 +123,39 @@ class ImageReleaseTests(unittest.TestCase):
             self.assertEqual(e.acquired_images, {})
 
 
+class PublishedRequirementsTests(unittest.TestCase):
+    def test_null_path_uses_exact_snapshot_and_restores_upstream(self):
+        upstream = Mock()
+        original = upstream.get_requirements
+        row = {"install_config":{"packages":"requirements.txt","reqs_path":None},
+               "requirements":"pytest==8.3.5\nexample==1.0\n"}
+        def build(value, namespace):
+            self.assertIs(value, row)
+            self.assertEqual(namespace, "swerebench")
+            self.assertEqual(upstream.get_requirements(value), row['requirements'])
+            return 'spec'
+        spec, receipt = module.published_test_spec(row, build, upstream)
+        self.assertEqual(spec, 'spec')
+        self.assertIs(upstream.get_requirements, original)
+        self.assertTrue(receipt['uses_existing_image'])
+        with self.assertRaises(ValueError):
+            module.published_test_spec(row, Mock(side_effect=ValueError('build failed')), upstream)
+        self.assertIs(upstream.get_requirements, original)
+
+    def test_explicit_paths_keep_upstream_behavior(self):
+        upstream, build = Mock(), Mock(return_value='spec')
+        original = upstream.get_requirements
+        row = {'install_config':{'packages':'requirements.txt','reqs_path':['requirements.txt']}}
+        self.assertEqual(module.published_test_spec(row, build, upstream), ('spec',None))
+        self.assertIs(upstream.get_requirements, original)
+
+    def test_missing_snapshot_is_not_empty_dependencies(self):
+        row = {'install_config':{'packages':'requirements.txt','reqs_path':None}}
+        for value in [None, '', '  ', []]:
+            with self.assertRaises(RuntimeError):
+                module.published_test_spec(row | {'requirements':value}, Mock(), Mock())
+
+
 @unittest.skipUnless(sys.platform == "linux", "Linux process identity qualification")
 class RetentionTests(unittest.TestCase):
     def helper(self):

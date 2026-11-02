@@ -111,10 +111,31 @@ def docker_client():
     return c
 
 
+def published_test_spec(row, make_spec, python_spec):
+    """Render prebuilt-image metadata from its published requirements snapshot."""
+    install = row.get("install_config", {})
+    if install.get("packages") != "requirements.txt" or install.get("reqs_path") is not None:
+        return make_spec(row, namespace="swerebench"), None
+    requirements = row.get("requirements")
+    if not isinstance(requirements, str) or not requirements.strip():
+        raise RuntimeError("Missing published requirements; refuse an empty dependency fallback")
+    original = python_spec.get_requirements
+    # Each grader is an isolated child. Only unused environment-build rendering changes;
+    # run_instance uses the already verified image, original test script and test labels.
+    python_spec.get_requirements = lambda instance: requirements if instance is row else original(instance)
+    try:
+        spec = make_spec(row, namespace="swerebench")
+    finally:
+        python_spec.get_requirements = original
+    return spec, {"reason":"published_null_requirements_path", "uses_existing_image":True,
+                  "requirements_sha256":hashlib.sha256(requirements.encode()).hexdigest()}
+
+
 def grade(config, request):
     """Child process: import only the pinned Nebius fork, never the model runtime."""
     from swebench.harness.run_evaluation import run_instance
     from swebench.harness.test_spec.test_spec import make_test_spec
+    from swebench.harness.test_spec import python as python_spec
     row = json.loads(Path(request["row"]).read_text())
     out = Path(request["output"])
     out.mkdir(parents=True, exist_ok=False)
@@ -123,7 +144,10 @@ def grade(config, request):
     image = client.images.get(request["image"])
     if image.id != request["image_id"]:
         raise RuntimeError("Image drift")
-    spec = make_test_spec(row, namespace="swerebench")
+    spec, compatibility = published_test_spec(row, make_test_spec, python_spec)
+    if compatibility:
+        write(out/"spec-compatibility.json", compatibility | {"image_id":image.id,
+              "eval_script_sha256":hashlib.sha256(spec.eval_script.encode()).hexdigest()})
     if spec.instance_image_key != request["image"]:
         raise RuntimeError("Published image and official test specification disagree")
     os.chdir(out)
