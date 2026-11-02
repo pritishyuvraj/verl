@@ -269,14 +269,15 @@ def histogram(records, k=8):
             "all_zero_fraction": bins[0]/n if n else None, "all_pass_fraction": bins[k]/n if n else None}
 
 
-def next_completed_issue(pending):
+def next_completed_issue(pending, check_services=lambda: None):
     """Release any completed issue; one slow episode must not idle the other ranks."""
     while pending:
+        check_services()
         for index, (_, _, jobs) in enumerate(pending):
             if all(job.done() for job in jobs):
                 return pending.pop(index)
         cf.wait([job for _, _, jobs in pending for job in jobs if not job.done()],
-                return_when=cf.FIRST_COMPLETED)
+                return_when=cf.FIRST_COMPLETED, timeout=5)
     raise ValueError("No pending issues")
 
 
@@ -340,6 +341,12 @@ class Experiment:
             raise RuntimeError("Private scratch floor reached; preserved outputs, no broad cleanup")
         if shutil.disk_usage(self.out).free < e["disk_floor_gib"]*2**30:
             raise RuntimeError("Output disk floor reached; preserve trajectories")
+
+    def check_services(self):
+        for process, _ in self.services:
+            code = process.poll()
+            if code is not None:
+                raise RuntimeError(f"Inference service PID {process.pid} exited ({code}); stop new dispatch")
 
     def run_grade(self, row_path, patch, out, image):
         request = {"row": str(row_path), "patch": str(patch), "output": str(out),
@@ -491,6 +498,7 @@ class Experiment:
         out = self.out/"episodes"/task/arm/str(seed)
         try:
             with self.rank_slots[rank]:
+                self.check_services()
                 if self.deadline-time.monotonic()<self.c["episode"]["minutes"]*60+900:
                     raise TimeoutError("Insufficient slice budget; no generation dispatched")
                 self.capacity()
@@ -578,8 +586,9 @@ class Experiment:
                         break  # Build-only coverage remains explicitly pending.
                     if previous and (self.out/"qualification"/row["instance_id"]).exists():
                         continue  # Preserve every prior attempt; never regenerate an attempted issue.
+                    self.check_services()
                     if len(ready)>=self.c["environment"]["issues_per_batch"]:
-                        finish(next_completed_issue(ready))
+                        finish(next_completed_issue(ready, self.check_services))
                     self.status("running_and_qualifying" if self.services else "environment_qualification")
                     try:
                         image = self.qualify(row)
@@ -599,6 +608,7 @@ class Experiment:
                         continue
                     if not self.services:
                         self.start_server()
+                    self.check_services()
                     jobs=[pool.submit(self.episode,row,image,arm,seed)
                           for arm in self.c["arms"] for seed in self.c["seeds"]]
                     ready.append((row,image,jobs))

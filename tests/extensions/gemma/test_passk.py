@@ -43,6 +43,34 @@ class HistogramTests(unittest.TestCase):
 
 
 class ProgressTests(unittest.TestCase):
+    def test_dead_server_prevents_dispatch_even_with_live_proxy(self):
+        e = object.__new__(module.Experiment)
+        e.services = [(Mock(pid=101, poll=Mock(return_value=1)), None),
+                      (Mock(pid=102, poll=Mock(return_value=None)), None)]
+        with self.assertRaisesRegex(RuntimeError, "PID 101 exited"):
+            e.check_services()
+
+    def test_healthy_services_and_initial_qualification_allowed(self):
+        e = object.__new__(module.Experiment)
+        for services in ([], [(Mock(poll=Mock(return_value=None)), None)]):
+            e.services = services
+            e.check_services()
+
+    def test_dead_service_stops_wait_without_consuming_pending_issue(self):
+        pending = [("task", {}, [concurrent.futures.Future()])]
+        with self.assertRaisesRegex(RuntimeError, "service died"):
+            module.next_completed_issue(pending, Mock(side_effect=RuntimeError("service died")))
+        self.assertEqual(len(pending), 1)
+        self.assertFalse(pending[0][2][0].cancelled())
+
+    def test_observes_real_child_exit(self):
+        e = object.__new__(module.Experiment)
+        p = subprocess.Popen([sys.executable, "-c", "raise SystemExit(7)"])
+        p.wait(timeout=5)
+        e.services = [(p, None)]
+        with self.assertRaisesRegex(RuntimeError, "exited \\(7\\)"):
+            e.check_services()
+
     def test_slow_first_issue_does_not_block_completed_later_issue(self):
         slow, fast = concurrent.futures.Future(), concurrent.futures.Future()
         fast.set_result(None)
