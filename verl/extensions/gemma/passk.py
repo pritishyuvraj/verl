@@ -24,6 +24,64 @@ import uuid
 DOCKER = "unix:///dev/shm/pritish-gemma4-20261025/eval-docker/docker.sock"
 DAEMON = "9469315a-6cc5-4032-a513-6427b656879d"
 NEUTRAL = "diff --git a/.neutral_probe b/.neutral_probe\nnew file mode 100644\n--- /dev/null\n+++ b/.neutral_probe\n@@ -0,0 +1 @@\n+neutral\n"
+_process_cache = {"time": 0, "rows": []}
+_process_lock = threading.Lock()
+
+
+class QualificationRejected(RuntimeError):
+    """A task-specific control failed; retain it in coverage and continue other tasks."""
+
+
+def private_snapshot(pgid, retained=(), deadline=None):
+    """Share one cheap ps inventory; read /proc details only for this owned session."""
+    deadline = time.monotonic()+5 if deadline is None else deadline
+    def remaining():
+        seconds = deadline-time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("Private process observation deadline exhausted")
+        return seconds
+    if not _process_lock.acquire(timeout=remaining()):
+        raise TimeoutError("Private process inventory lock deadline exhausted")
+    try:
+        if time.monotonic()-_process_cache["time"] > .5:
+            result = subprocess.run(["ps", "-e", "-o", "pid=,pgid=,sid="],
+                                    capture_output=True, text=True, check=True, timeout=min(5,remaining()))
+            _process_cache.update(time=time.monotonic(), rows=[tuple(map(int,l.split())) for l in result.stdout.splitlines()])
+        pids = {pgid} | {p for p,g,s in _process_cache["rows"] if g == pgid or s == pgid} | set(map(int, retained))
+    finally:
+        _process_lock.release()
+    observed = {}
+    for pid in pids:
+        remaining()
+        directory = Path("/proc")/str(pid)
+        try:
+            fields = (directory/"stat").read_text().rsplit(")",1)[1].split()
+            uid = int(next(l.split()[1] for l in (directory/"status").read_text().splitlines() if l.startswith("Uid:")))
+        except FileNotFoundError:
+            continue  # Actual ESRCH; permission/read failures propagate.
+        observed[pid] = {"pid":pid,"ppid":int(fields[1]),"pgid":int(fields[2]),"sid":int(fields[3]),
+                         "uid":uid,"state":fields[0],"start_ticks":fields[19]}
+    return observed
+
+
+def live_retention(base):
+    class LiveRetainedGroup(base):
+        def _remember(self, observed):
+            # Keep historical identities, but bound concurrently live members, not lifetime forks.
+            for pid, previous in list(self.record["known_processes"].items()):
+                current = observed.get(int(pid))
+                dead = current is not None and current["state"] == "Z" and all(
+                    current[k] == previous[k] for k in ("pid","uid","sid","pgid","start_ticks"))
+                if current is None:
+                    try:
+                        (Path("/proc")/pid).stat()
+                    except FileNotFoundError:
+                        dead = True
+                if dead:
+                    self.record.setdefault("retired_processes", []).append(previous)
+                    del self.record["known_processes"][pid]
+            super()._remember(observed)
+    return LiveRetainedGroup
 
 
 def digest(path):
@@ -205,7 +263,9 @@ class Experiment:
         self.client = docker_client()
         sys.path.insert(0, str(self.root / "scripts"))
         from owned_process_group_v4 import RetainedGroup
-        self.retain = RetainedGroup
+        self.retain = live_retention(RetainedGroup)
+        self.attempt = self.out/"attempts"/str(time.time_ns())
+        self.attempt.mkdir(parents=True, exist_ok=False)
         self.services = []
         self.initial_images = {i.id for i in self.client.images.list()}
         self.grade_slots = threading.Semaphore(config["environment"]["grading_workers"])
@@ -221,7 +281,12 @@ class Experiment:
         with path.open("xb") as log:
             p = subprocess.Popen(list(map(str, command)), stdout=log, stderr=subprocess.STDOUT,
                                  env=env, start_new_session=True, cwd=self.out)
-        retained = self.retain(p, path.with_suffix(".ownership.json"), role="client")
+        holder = {}
+        def snapshot(deadline=None):
+            keys = holder["group"].record["known_processes"] if "group" in holder else ()
+            return private_snapshot(p.pid, keys, deadline=deadline)
+        retained = self.retain(p, path.with_suffix(".ownership.json"), role="client", snapshot=snapshot)
+        holder["group"] = retained
         return p, retained
 
     def bounded(self, command, path, seconds, *, grading=False):
@@ -289,8 +354,15 @@ class Experiment:
             file.write_text(patch)
             outcome = self.run_grade(row_path, file, directory/label, entry)
             if outcome["resolved"] != (label == "gold") or not outcome["tests_executed"]:
-                raise RuntimeError(f"Environment {label} control failed")
+                raise QualificationRejected(f"Environment {label} control failed")
             entry[label+"_outcome_sha256"] = digest(directory/label/"outcome.json")
+        prepare = directory/"solver-preparation"
+        prepare.mkdir()
+        public_request = {"project_root":str(self.root),"output":str(prepare),"task":{
+            k:row[k] for k in ("instance_id","repo","base_commit","problem_statement","version")},
+            "image":entry,"prepare_only":True}
+        write(directory/"prepare-request.json", public_request)
+        self.bounded([self.python,self.worker,"--request",directory/"prepare-request.json"],directory/"prepare.log",300)
         entry["row"] = str(row_path)
         write(directory/"admission.json", entry)
         return entry
@@ -332,8 +404,8 @@ class Experiment:
                    "--override-generation-config",'{"temperature":1.0,"top_p":0.95,"top_k":64}',
                    "--enable-lora","--max-loras","1","--max-cpu-loras","1","--max-lora-rank","32",
                    "--lora-modules","hor3_step25="+self.c["adapter"]]
-        write(self.out/"server-command.json", command)
-        server = self.spawn(command, self.out/"server.log")
+        write(self.attempt/"server-command.json", command)
+        server = self.spawn(command, self.attempt/"server.log")
         self.services.append(server)
         until = time.monotonic()+1200
         while time.monotonic()<until:
@@ -349,7 +421,7 @@ class Experiment:
             time.sleep(2)
         else:
             raise TimeoutError("vLLM readiness deadline")
-        proxy_process = self.spawn([self.python,self.script,"--config",self.config_path,"--mode","proxy"],self.out/"proxy.log")
+        proxy_process = self.spawn([self.python,self.script,"--config",self.config_path,"--mode","proxy"],self.attempt/"proxy.log")
         self.services.append(proxy_process)
         for _ in range(60):
             try:
@@ -411,8 +483,21 @@ class Experiment:
                   "episode_failures":len(list((self.out/"episodes").glob("*/*/*/failure.json")))})
 
     def run(self):
-        if (self.out/"launch.json").exists():
-            raise RuntimeError("Existing launch: reconcile saved episodes before continuation; never reroll")
+        import fcntl
+        self.run_lock = (self.out/"controller.lock").open("a")
+        fcntl.flock(self.run_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        previous = json.loads((self.out/"launch.json").read_text()) if (self.out/"launch.json").exists() else None
+        if previous:
+            if previous["config"] != self.c:
+                raise RuntimeError("Continuation must preserve the exact experiment configuration")
+            self.deadline = time.monotonic()+previous["started_unix"]+self.c["wall_seconds"]-time.time()
+            for path in self.out.glob("episodes/*/*/*/result.json"):
+                result=json.loads(path.read_text())
+                if digest(path.parent/"agent.patch") != result["patch_sha256"]:
+                    raise RuntimeError("Saved prediction changed")
+                if result.get("tests_executed") and digest(result["report"])!=result["report_sha256"]:
+                    raise RuntimeError("Saved grading report changed")
+                self.results.setdefault((path.parents[2].name,path.parents[1].name),[]).append(result)
         if digest(Path(self.c["adapter"])/"adapter_model.safetensors")!=self.c["adapter_sha256"]:
             raise RuntimeError("Wrong SFT checkpoint")
         fork_revision = subprocess.check_output(["git","-C",str(self.out/"harness"),"rev-parse","HEAD"],text=True).strip()
@@ -422,9 +507,10 @@ class Experiment:
         self.cohort = cohort
         if digest(self.out/"private/tasks.jsonl")!=cohort["tasks_sha256"]:
             raise RuntimeError("Cohort changed")
-        write(self.out/"launch.json",{"owner":self.owner,"config":self.c,"started_unix":time.time(),
+        write(self.attempt/"launch.json" if previous else self.out/"launch.json",{"owner":self.owner,"config":self.c,"started_unix":time.time(),
                                     "sources":{str(p):digest(p) for p in (Path(self.script),self.worker)}})
-        self.bundles()
+        if not previous:
+            self.bundles()
         ready = []
         consecutive_failures = 0
         try:
@@ -441,12 +527,19 @@ class Experiment:
                     row = json.loads(line)
                     if not row.get("image_name") or self.deadline-time.monotonic()<5400:
                         break  # Build-only coverage remains explicitly pending.
+                    if previous and (self.out/"qualification"/row["instance_id"]).exists():
+                        continue  # Preserve every prior attempt; never regenerate an attempted issue.
                     if len(ready)>=self.c["environment"]["issues_per_batch"]:
                         finish(ready.pop(0))
                     self.status("running_and_qualifying" if self.services else "environment_qualification")
                     try:
                         image = self.qualify(row)
                         consecutive_failures = 0
+                    except QualificationRejected as e:
+                        write(self.out/"qualification"/row["instance_id"]/"failure.json",{
+                            "error":repr(e),"model_attempts":0,"classification":"failed_reference_control"})
+                        consecutive_failures = 0
+                        continue
                     except Exception as e:
                         write(self.out/"qualification"/row["instance_id"]/"failure.json",{"error":repr(e),"model_attempts":0})
                         consecutive_failures += 1
@@ -463,12 +556,19 @@ class Experiment:
                     finish(item)
             self.status("slice_complete_coverage_pending")
         except BaseException as e:
-            write(self.out/"failure.json",{"error":repr(e),"predictions_preserved":True})
+            write(self.attempt/"failure.json",{"error":repr(e),"predictions_preserved":True})
             self.status("failed")
             raise
         finally:
+            cleanup_errors=[]
             for p,group in reversed(self.services):
-                group.cleanup()
+                try:
+                    group.cleanup()
+                except Exception as error:
+                    cleanup_errors.append({"pid":p.pid,"error":repr(error)})
+            write(self.attempt/"cleanup.json",{"clean":not cleanup_errors,"errors":cleanup_errors})
+            if cleanup_errors:
+                raise RuntimeError(f"Owned service cleanup failed: {cleanup_errors}")
 
 
 def main():

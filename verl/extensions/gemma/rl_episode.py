@@ -62,6 +62,9 @@ def main():
     prepared.mkdir()
     snapshot, setup, _ = helper.prepare_snapshot(task, image, prepared, factory,
                                                 profile["identity"] if profile else None)
+    if request.get("prepare_only"):
+        (out/"prepared.json").write_text(json.dumps({"snapshot":str(snapshot),"setup":str(setup)}))
+        return
     bundle = Path(request["bundle"])
     adapters = discover_adapters(str(bundle), adapter_extensions=ALLOWED_ADAPTER_EXTENSIONS)
     endpoint = urlsplit(request["endpoint"])
