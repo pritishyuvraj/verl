@@ -7,6 +7,8 @@ import os
 import subprocess
 import sys
 import concurrent.futures
+from unittest.mock import patch
+import time
 
 PATH = Path(__file__).resolve().parents[3]/"verl/extensions/gemma/passk.py"
 spec = importlib.util.spec_from_file_location("passk_under_test", PATH)
@@ -38,6 +40,35 @@ class HistogramTests(unittest.TestCase):
             module.write(path,{"resolved":True})
             self.assertEqual(json.loads(path.read_text()),{"resolved":True})
             self.assertEqual(list(path.parent.glob("*.tmp")),[])
+
+
+class ProgressTests(unittest.TestCase):
+    def test_slow_first_issue_does_not_block_completed_later_issue(self):
+        slow, fast = concurrent.futures.Future(), concurrent.futures.Future()
+        fast.set_result(None)
+        pending = [("slow", {}, [slow]), ("fast", {}, [fast])]
+        self.assertEqual(module.next_completed_issue(pending)[0], "fast")
+        self.assertEqual(pending[0][0], "slow")
+        self.assertFalse(slow.cancelled())
+
+    def test_waits_for_all_attempts_of_any_issue(self):
+        a, b = concurrent.futures.Future(), concurrent.futures.Future()
+        a.set_result(None)
+        pending = [("task", {}, [a, b])]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            waiting = pool.submit(module.next_completed_issue, pending)
+            self.assertFalse(waiting.done())
+            b.set_result(None)
+            self.assertEqual(waiting.result(timeout=2)[0], "task")
+        self.assertEqual(pending, [])
+
+    def test_process_disappears_during_proc_read(self):
+        with patch.dict(module._process_cache, {"time": time.monotonic(), "rows": []}):
+            with patch.object(Path, "read_text", side_effect=ProcessLookupError(3, "No such process")):
+                self.assertEqual(module.private_snapshot(12345), {})
+            with patch.object(Path, "read_text", side_effect=PermissionError("denied")):
+                with self.assertRaises(PermissionError):
+                    module.private_snapshot(12345)
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux process identity qualification")

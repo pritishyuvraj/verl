@@ -57,7 +57,7 @@ def private_snapshot(pgid, retained=(), deadline=None):
         try:
             fields = (directory/"stat").read_text().rsplit(")",1)[1].split()
             uid = int(next(l.split()[1] for l in (directory/"status").read_text().splitlines() if l.startswith("Uid:")))
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue  # Actual ESRCH; permission/read failures propagate.
         observed[pid] = {"pid":pid,"ppid":int(fields[1]),"pgid":int(fields[2]),"sid":int(fields[3]),
                          "uid":uid,"state":fields[0],"start_ticks":fields[19]}
@@ -243,6 +243,17 @@ def histogram(records, k=8):
             "pass_at_8": (n-bins[0])/n if n else None,
             "mean_attempt_success": sum(i*v for i,v in enumerate(bins))/(k*n) if n else None,
             "all_zero_fraction": bins[0]/n if n else None, "all_pass_fraction": bins[k]/n if n else None}
+
+
+def next_completed_issue(pending):
+    """Release any completed issue; one slow episode must not idle the other ranks."""
+    while pending:
+        for index, (_, _, jobs) in enumerate(pending):
+            if all(job.done() for job in jobs):
+                return pending.pop(index)
+        cf.wait([job for _, _, jobs in pending for job in jobs if not job.done()],
+                return_when=cf.FIRST_COMPLETED)
+    raise ValueError("No pending issues")
 
 
 class Experiment:
@@ -530,7 +541,7 @@ class Experiment:
                     if previous and (self.out/"qualification"/row["instance_id"]).exists():
                         continue  # Preserve every prior attempt; never regenerate an attempted issue.
                     if len(ready)>=self.c["environment"]["issues_per_batch"]:
-                        finish(ready.pop(0))
+                        finish(next_completed_issue(ready))
                     self.status("running_and_qualifying" if self.services else "environment_qualification")
                     try:
                         image = self.qualify(row)
